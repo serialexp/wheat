@@ -197,7 +197,8 @@ impl RepositoriesDirectory {
     /// writes its lock.
     ///
     /// The copy of the store keeps the content records the original holds, which
-    /// nothing reads here; collecting the network's garbage drops them.
+    /// nothing reads here. Pool GC keeps them too, for now: dropping them is still to
+    /// be built (`docs/design/wheat-network-maintenance.md`, Outstanding).
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn adopt_repository(
         &self,

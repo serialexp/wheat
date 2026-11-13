@@ -7,6 +7,7 @@ use super::catalog::{
     BULK_FILE_PREFIX, CATALOG_LOCK_FILE, CATALOGS_DIRECTORY, LOCATOR_FILE, NEXT_ACTIVE_FILE,
     SEGMENTS_DIRECTORY, SESSION_FILE, is_temporary_file_name,
 };
+use super::store::RETIRED_DIRECTORY;
 
 const PACKED_DIRECTORY: &str = "packed";
 const LOOSE_OBJECTS_DIRECTORY: &str = "loose-objects";
@@ -29,7 +30,8 @@ pub(crate) enum StoreFile {
     Mutable,
     /// Not the store's state: its lock, the marker of an open session, the locator index (rebuilt when the copy is
     /// opened), the record of its last content check (its file times do not carry
-    /// over), and the temporary and unpublished files opening a store removes.
+    /// over), and the temporary and unpublished files opening a store removes, among
+    /// them what a sweep removed that pinned readers can still read.
     Skipped,
 }
 
@@ -46,6 +48,7 @@ pub(crate) fn classify(relative: &Path) -> StoreFile {
         return StoreFile::Mutable;
     };
     match names.as_slice() {
+        [RETIRED_DIRECTORY, ..] => StoreFile::Skipped,
         [PACKED_DIRECTORY, name] if is_packed_leftover(name) => StoreFile::Skipped,
         [PACKED_DIRECTORY, SEGMENTS_DIRECTORY, name]
             if is_temporary_file_name(name) || name.starts_with(BULK_FILE_PREFIX) =>
@@ -105,6 +108,7 @@ mod tests {
             ("packed/segments/.tmpAb12Cd", StoreFile::Skipped),
             ("packed/segments/bulk-4.segment", StoreFile::Skipped),
             ("loose-content/ab/.cdef.42.tmp", StoreFile::Skipped),
+            ("retired/sweep-Ab12Cd/ab/cdef", StoreFile::Skipped),
             ("something-new", StoreFile::Mutable),
         ] {
             assert_eq!(classify(Path::new(path)), expected, "{path}");

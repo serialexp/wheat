@@ -14,8 +14,8 @@ use thiserror::Error;
 use wheat_core::{ContentChunkManifestRecord, ContentId, ObjectId, VerifiedContent};
 
 use crate::{
-    BatchObjectStore, ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError,
-    StoredInventory, StoredObject,
+    BatchObjectStore, CollectableStructure, ContentStore, ContentStoreError, ImmutableObjectStore,
+    ObjectStoreError, StoredInventory, StoredObject,
     batch::stored_object,
     content_store::{ContentBackend, ContentItem, StoredContent},
 };
@@ -49,6 +49,12 @@ pub trait RepositoryStore: ImmutableObjectStore {
     /// What the store holds, listed, when it can: the pool structure GC counts
     /// ([`crate::analyze_structure`]). `None` for a store that cannot list its objects.
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        None
+    }
+
+    /// The store, when it can remove what no head reaches ([`crate::collect_structure`])
+    /// and pin a reader's view across that. `None` for a store that cannot.
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
         None
     }
 }
@@ -277,6 +283,10 @@ impl<P: RepositoryStore, C: RepositoryStore> RepositoryStore for NetworkStore<P,
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
         self.pool.structural_inventory()
     }
+
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
+        self.pool.collectable_structure()
+    }
 }
 
 #[async_trait]
@@ -295,6 +305,9 @@ impl<T: RepositoryStore + ?Sized> RepositoryStore for &T {
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
         (**self).structural_inventory()
     }
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
+        (**self).collectable_structure()
+    }
 }
 
 #[async_trait]
@@ -312,6 +325,9 @@ impl<T: RepositoryStore + ?Sized> RepositoryStore for Arc<T> {
     }
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
         (**self).structural_inventory()
+    }
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
+        (**self).collectable_structure()
     }
 }
 
@@ -361,6 +377,9 @@ impl RepositoryStore for Box<dyn RepositoryStore> {
     }
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
         (**self).structural_inventory()
+    }
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
+        (**self).collectable_structure()
     }
 }
 

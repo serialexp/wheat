@@ -178,7 +178,13 @@ struct PackedEngine {
     loose_threshold: usize,
     durability: Durability,
     trace: Option<Arc<PackedStoreTraceCounters>>,
+    /// What readers read until the next sweep; see [`sweep`].
+    epoch: Mutex<Arc<sweep::Epoch>>,
 }
+
+#[path = "sweep.rs"]
+mod sweep;
+pub(crate) use sweep::RETIRED_DIRECTORY;
 
 impl fmt::Debug for PackedObjectStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -467,6 +473,7 @@ impl PackedObjectStore {
             .and_then(|()| remove_partial_generations(root, content_generation.generation))
             .map_err(|error| ObjectStoreError::Integrity(error.to_string()))?;
         let generation_bytes = generation_bytes(root, content_generation)?;
+        sweep::remove_retired(root)?;
         Ok(Self {
             engine: Arc::new(PackedEngine {
                 catalog: SharedCatalog::new(catalog),
@@ -480,6 +487,7 @@ impl PackedObjectStore {
                 loose_threshold,
                 durability,
                 trace,
+                epoch: Mutex::default(),
             }),
         })
     }
@@ -1765,6 +1773,10 @@ impl StoredInventory for PackedObjectStore {
 #[async_trait]
 impl RepositoryStore for PackedObjectStore {
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
+        Some(self)
+    }
+
+    fn collectable_structure(&self) -> Option<&dyn crate::CollectableStructure> {
         Some(self)
     }
 

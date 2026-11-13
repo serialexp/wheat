@@ -1,21 +1,27 @@
-//! What a pool holds that no head reaches: the dry run of structural garbage
-//! collection (`docs/design/wheat-network-maintenance.md`, "Pool GC").
+//! What a pool holds that no head reaches: structural garbage collection
+//! (`docs/design/wheat-network-maintenance.md`, "Pool GC").
 //!
 //! Every publish leaves the previous envelope, its label manifest and the old nodes of
-//! each set the new state rewrote unreachable, and nothing removes them. This walks
-//! the closure of every head of a network, lists what the store holds, and counts
-//! what no head reaches, by kind. It deletes nothing, and so needs no hold on the
-//! network: a publish while it runs can leave its new objects counted as
-//! unreachable, since the walk read the heads before it. The real collection checks
-//! each head completely and holds publishes (Bart, 2026-11-12).
+//! each set the new state rewrote unreachable, and nothing removes them.
+//!
+//! - [`analyze_structure`], the dry run, walks the closure of every head of a network,
+//!   lists what the store holds, and counts what no head reaches, by kind. It deletes
+//!   nothing, and so needs no hold on the network: a publish while it runs can leave
+//!   its new objects counted as unreachable, since the walk read the heads before it.
+//! - [`collect_structure`] validates each head completely, marks what they reach and
+//!   removes the rest, with the network's writers held (Bart, 2026-11-12). Readers
+//!   that began before it go on reading what it removed through a [`StorePin`].
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
 use rusqlite::params;
+use thiserror::Error;
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 
 use crate::{
-    ImmutableObjectStore, ObjectKind, ObjectStoreError, SnapshotError, SnapshotLimits,
+    ImmutableObjectStore, ObjectKind, ObjectStoreError, RepositoryPublicationError,
+    RepositoryReader, RepositoryStore, SnapshotError, SnapshotLimits, StoredObject,
     snapshot::ClosureWalk,
 };
 
@@ -150,6 +156,299 @@ pub async fn analyze_structure<O: ImmutableObjectStore + ?Sized>(
     let connection = walk.connection();
     load_inventory(connection, inventory)?;
     summarize(connection, roots.len())
+}
+
+/// A pool that can remove what no head reaches: [`collect_structure`].
+pub trait CollectableStructure: StoredInventory {
+    /// A view of the store as it is now, for a reader that must go on reading what
+    /// it began with while a sweep runs (a fetch). What a later sweep removes stays
+    /// readable through the pin, and on disk, until the last pin taken before that
+    /// sweep is dropped.
+    fn pin(&self) -> StorePin;
+
+    /// Removes every object `marks` does not hold. The caller holds every writer
+    /// of the store from before the marks were taken until this returns: an object
+    /// written meanwhile is not marked, and so is removed.
+    fn sweep(&self, marks: &ObjectMarks) -> Result<SweepReport, ObjectStoreError>;
+}
+
+/// What a sweep kept and removed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SweepReport {
+    /// Objects in segments: copied into the new segments, and left out of them.
+    pub objects_kept: u64,
+    pub object_bytes_kept: u64,
+    pub objects_dropped: u64,
+    pub object_bytes_dropped: u64,
+    /// Objects too large for a segment, kept as files of their own, that were removed.
+    pub loose_objects_retired: u64,
+    pub loose_object_bytes_retired: u64,
+    /// Content records the pool keeps beside its objects, all kept.
+    pub content_records_kept: u64,
+    /// The segments, and the bytes they take, before and after.
+    pub segments_before: u64,
+    pub segment_bytes_before: u64,
+    pub segments_after: u64,
+    pub segment_bytes_after: u64,
+}
+
+/// A reader's view of a store from before a sweep: see [`CollectableStructure::pin`].
+#[derive(Clone)]
+pub struct StorePin(Arc<dyn RemovedObjects>);
+
+impl std::fmt::Debug for StorePin {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("StorePin").finish_non_exhaustive()
+    }
+}
+
+/// What a sweep removed after a pin was taken, readable through it.
+pub(crate) trait RemovedObjects: Send + Sync {
+    /// The object `id`, if a sweep after the pin was taken removed it.
+    fn removed_object(&self, id: ObjectId) -> Result<Option<StoredObject>, ObjectStoreError>;
+}
+
+impl StorePin {
+    pub(crate) fn new(removed: Arc<dyn RemovedObjects>) -> Self {
+        Self(removed)
+    }
+
+    /// The object `id`, if a sweep removed it after this pin was taken.
+    pub fn removed_object(&self, id: ObjectId) -> Result<Option<StoredObject>, ObjectStoreError> {
+        self.0.removed_object(id)
+    }
+}
+
+/// An object store read through a [`StorePin`]: an object a sweep removed after the
+/// pin was taken is still found. Writes go to the store as they are.
+#[derive(Clone, Debug)]
+pub struct PinnedObjects<O> {
+    objects: O,
+    pin: Option<StorePin>,
+}
+
+impl<O> PinnedObjects<O> {
+    /// `objects`, read through `pin`; as `objects` alone when `pin` is `None`, for a
+    /// store no sweep runs on.
+    pub fn new(objects: O, pin: Option<StorePin>) -> Self {
+        Self { objects, pin }
+    }
+
+    pub fn inner(&self) -> &O {
+        &self.objects
+    }
+}
+
+#[async_trait]
+impl<O: ImmutableObjectStore> ImmutableObjectStore for PinnedObjects<O> {
+    async fn put_if_absent(
+        &self,
+        id: ObjectId,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ObjectStoreError> {
+        self.objects.put_if_absent(id, canonical_bytes).await
+    }
+
+    async fn put_batch(
+        &self,
+        objects: &[(ObjectId, Vec<u8>)],
+        concurrency: usize,
+    ) -> Result<(), ObjectStoreError> {
+        self.objects.put_batch(objects, concurrency).await
+    }
+
+    async fn get(&self, id: ObjectId) -> Result<StoredObject, ObjectStoreError> {
+        match self.objects.get(id).await {
+            Err(ObjectStoreError::Missing(missing)) => match &self.pin {
+                Some(pin) => pin
+                    .removed_object(id)?
+                    .ok_or(ObjectStoreError::Missing(missing)),
+                None => Err(ObjectStoreError::Missing(missing)),
+            },
+            result => result,
+        }
+    }
+
+    async fn exists_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, ObjectStoreError> {
+        let mut found = self.objects.exists_many(ids).await?;
+        if let Some(pin) = &self.pin {
+            for (id, found) in ids.iter().zip(&mut found) {
+                if !*found {
+                    *found = pin.removed_object(*id)?.is_some();
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn seal(&self) -> Result<(), ObjectStoreError> {
+        self.objects.seal().await
+    }
+}
+
+/// The objects every head reaches, as the walk marked them on disk: what a sweep
+/// keeps. Also records what a sweep has copied, so a record two segments hold is
+/// copied once.
+pub struct ObjectMarks {
+    walk: ClosureWalk,
+    marked: u64,
+}
+
+impl ObjectMarks {
+    fn new(walk: ClosureWalk) -> Result<Self, SnapshotError> {
+        let connection = walk.connection();
+        connection.execute_batch(
+            "CREATE TABLE copied (
+                 namespace INTEGER NOT NULL,
+                 id BLOB NOT NULL,
+                 PRIMARY KEY (namespace, id)
+             ) WITHOUT ROWID;",
+        )?;
+        let marked: i64 =
+            connection.query_row("SELECT count(*) FROM objects", [], |row| row.get(0))?;
+        Ok(Self {
+            walk,
+            marked: u64::try_from(marked).unwrap_or(0),
+        })
+    }
+
+    /// How many objects are marked.
+    #[must_use]
+    pub fn marked(&self) -> u64 {
+        self.marked
+    }
+
+    /// Whether a head reaches the object `digest`.
+    pub(crate) fn contains(&self, digest: &[u8; 32]) -> rusqlite::Result<bool> {
+        self.walk
+            .connection()
+            .prepare_cached("SELECT 1 FROM objects WHERE id = ?1")?
+            .exists([digest.as_slice()])
+    }
+
+    /// Records that a sweep copied the record `namespace`/`digest`. False when it
+    /// already had.
+    pub(crate) fn first_copy(&self, namespace: u8, digest: &[u8; 32]) -> rusqlite::Result<bool> {
+        Ok(self
+            .walk
+            .connection()
+            .prepare_cached("INSERT OR IGNORE INTO copied (namespace, id) VALUES (?1, ?2)")?
+            .execute(params![namespace, digest.as_slice()])?
+            == 1)
+    }
+
+    /// Groups what follows into one transaction, until [`Self::commit`]: one per
+    /// record would cost most of what the sweep's bookkeeping does.
+    pub(crate) fn begin(&self) -> rusqlite::Result<()> {
+        self.walk.connection().execute_batch("BEGIN")
+    }
+
+    pub(crate) fn commit(&self) -> rusqlite::Result<()> {
+        self.walk.connection().execute_batch("COMMIT")
+    }
+}
+
+/// Why [`collect_structure`] removed nothing.
+#[derive(Debug, Error)]
+pub enum StructureCollectionError {
+    #[error("this store cannot collect what no head reaches")]
+    Unsupported,
+    #[error("a collection needs at least one head; with none, it would remove everything")]
+    NoHeads,
+    #[error("head {head} does not validate: {source}")]
+    Invalid {
+        head: RepositoryEnvelopeId,
+        source: RepositoryPublicationError,
+    },
+    #[error("marking what the heads reach failed: {0}")]
+    Mark(#[from] SnapshotError),
+    #[error("sweeping failed: {0}")]
+    Sweep(#[from] ObjectStoreError),
+}
+
+/// What [`collect_structure`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StructureCollection {
+    /// The heads validated and walked.
+    pub roots: usize,
+    /// The objects they reach.
+    pub marked: u64,
+    pub sweep: SweepReport,
+}
+
+impl std::fmt::Display for StructureCollection {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sweep = &self.sweep;
+        writeln!(
+            out,
+            "{} heads validated, reaching {} objects",
+            self.roots, self.marked
+        )?;
+        writeln!(
+            out,
+            "segments: {} objects ({} bytes) kept, {} objects ({} bytes) removed",
+            sweep.objects_kept,
+            sweep.object_bytes_kept,
+            sweep.objects_dropped,
+            sweep.object_bytes_dropped
+        )?;
+        writeln!(
+            out,
+            "large objects: {} ({} bytes) removed",
+            sweep.loose_objects_retired, sweep.loose_object_bytes_retired
+        )?;
+        writeln!(
+            out,
+            "{} segments ({} bytes) replaced by {} ({} bytes); {} content records kept",
+            sweep.segments_before,
+            sweep.segment_bytes_before,
+            sweep.segments_after,
+            sweep.segment_bytes_after,
+            sweep.content_records_kept
+        )
+    }
+}
+
+/// Removes from `store` every object none of `roots`, the heads of every
+/// repository sharing the store, reaches.
+///
+/// Fails closed, removing nothing, when a head does not validate completely
+/// ([`RepositoryReader::validate_envelope`]) or cannot be walked to the end. The
+/// caller holds every writer of the store from before this is called until it
+/// returns (in a server, wheat-server's `Registry::quiesce`); fetches may go on, reading through
+/// a [`CollectableStructure::pin`] taken when they began.
+///
+/// Reads each head's closure to validate it and once more to mark it, with the
+/// marks on disk; writes the kept objects once.
+#[tracing::instrument(level = "debug", skip_all, fields(roots = roots.len()))]
+pub async fn collect_structure<S: RepositoryStore>(
+    store: &S,
+    roots: &[RepositoryEnvelopeId],
+    limits: SnapshotLimits,
+) -> Result<StructureCollection, StructureCollectionError> {
+    let collector = store
+        .collectable_structure()
+        .ok_or(StructureCollectionError::Unsupported)?;
+    if roots.is_empty() {
+        return Err(StructureCollectionError::NoHeads);
+    }
+    let content = store.content_store();
+    let reader = RepositoryReader::new(store, &content);
+    for head in roots {
+        reader.validate_envelope(*head).await.map_err(|source| {
+            StructureCollectionError::Invalid {
+                head: *head,
+                source,
+            }
+        })?;
+    }
+    let marks = ObjectMarks::new(walk_heads(store, roots, limits).await?)?;
+    let sweep = collector.sweep(&marks)?;
+    Ok(StructureCollection {
+        roots: roots.len(),
+        marked: marks.marked(),
+        sweep,
+    })
 }
 
 /// Objects the walk handles per SQLite transaction.

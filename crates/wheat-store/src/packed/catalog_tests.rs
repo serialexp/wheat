@@ -1465,3 +1465,109 @@ fn interrupted_delta_repack_recovers_old_or_new_authority() {
         assert_history(&mut reopened, &history);
     }
 }
+
+/// The `.segment` files in a catalog's segments directory.
+fn segment_files(root: &std::path::Path) -> usize {
+    fs::read_dir(root.join("segments"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".segment")
+        })
+        .count()
+}
+
+#[test]
+fn a_collection_keeps_what_it_is_told_and_retires_the_old_segments() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    let kept = record(b"kept");
+    let dropped = record(b"dropped");
+    store.put_records(&[kept, dropped]).unwrap();
+    // A second segment holding a record the first holds too: copied once. Beginning
+    // a collection seals the active segment.
+    drop(store.begin_collection().unwrap());
+    store.put_records(&[kept]).unwrap();
+
+    let sources = store.begin_collection().unwrap();
+    let before = segment_files(root.path());
+    let mut copied = std::collections::HashSet::new();
+    let mut keep = |listed: &ListedRecord| {
+        Ok(if listed.digest == dropped.digest {
+            Keep::Drop
+        } else if copied.insert(listed.digest) {
+            Keep::Copy
+        } else {
+            Keep::Duplicate
+        })
+    };
+    let built = build_collection(sources, &mut keep, 1 << 20).unwrap();
+    assert_eq!(built.counts.content_kept, 1);
+    assert_eq!(built.counts.content_dropped, 1);
+    assert_eq!(built.counts.segments_written, 1);
+    let content = store.content_generation();
+    let mut retired = store.publish_collection(built, content).unwrap();
+    assert_eq!(retired.segments, before);
+
+    assert_value(&mut store, kept);
+    assert!(
+        store
+            .get(CONTENT_NAMESPACE, dropped.digest)
+            .unwrap()
+            .is_none()
+    );
+    // What the collection left out is readable through what it retired, and its
+    // files stay until that is dropped.
+    let payload = retired
+        .get(CONTENT_NAMESPACE, dropped.digest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload.bytes(), b"dropped");
+    assert_eq!(segment_files(root.path()), before + 1);
+    drop(retired);
+    assert_eq!(segment_files(root.path()), 1);
+
+    store.close().unwrap();
+    let mut reopened = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    assert_value(&mut reopened, kept);
+    assert!(
+        reopened
+            .get(CONTENT_NAMESPACE, dropped.digest)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_collection_is_refused_when_the_catalog_changed_after_it_began() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = PackedCatalog::open(root.path(), crate::Durability::Durable).unwrap();
+    let first = record(b"first");
+    store.put_records(&[first]).unwrap();
+    let sources = store.begin_collection().unwrap();
+    let late = record(b"written while the collection ran");
+    store.put_records(&[late]).unwrap();
+
+    let built = build_collection(sources, &mut |_| Ok(Keep::Copy), 1 << 20).unwrap();
+    let content = store.content_generation();
+    assert!(matches!(
+        store.publish_collection(built, content),
+        Err(CatalogError::RepackStaleAuthority)
+    ));
+    // Nothing was published: both records read, and the replacement was never named.
+    assert_value(&mut store, first);
+    assert_value(&mut store, late);
+    assert_eq!(segment_files(root.path()), 1);
+    let names = fs::read_dir(root.path().join("segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().all(|name| name.ends_with(".segment")),
+        "no temporary file is left: {names:?}"
+    );
+}

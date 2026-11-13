@@ -397,6 +397,40 @@ impl LooseObjectStore {
         Ok(())
     }
 
+    /// Moves the files of `ids` into `target`, where they keep their names: out of
+    /// this store, still readable through `target`. An ID with no file is skipped.
+    /// Both stores are on one filesystem.
+    pub(crate) fn retire_into(
+        &self,
+        ids: &[ObjectId],
+        target: &LooseObjectStore,
+    ) -> Result<(), ObjectStoreError> {
+        let mut changed = std::collections::BTreeSet::new();
+        let mut created = std::collections::BTreeSet::new();
+        for id in ids {
+            let path = self.path(*id);
+            let destination = target.path(*id);
+            if let Some(shard) = destination.parent()
+                && created.insert(shard.to_path_buf())
+            {
+                fs::create_dir_all(shard)?;
+            }
+            match fs::rename(&path, &destination) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        changed.insert(parent.to_path_buf());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for directory in changed {
+            self.durability.sync_directory(&directory)?;
+        }
+        Ok(())
+    }
+
     fn verify_bytes(
         id: ObjectId,
         canonical_bytes: Vec<u8>,

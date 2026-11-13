@@ -120,7 +120,11 @@ pub use snapshot::{
     SnapshotId, SnapshotLimits, SnapshotManifest, SnapshotSink, SnapshotSource, export_snapshot,
     export_snapshot_to, restore_snapshot, restore_snapshot_from,
 };
-pub use structure_gc::{Counts, StoredInventory, StoredRecord, StructureReport, analyze_structure};
+pub use structure_gc::{
+    CollectableStructure, Counts, ObjectMarks, PinnedObjects, StorePin, StoredInventory,
+    StoredRecord, StructureCollection, StructureCollectionError, StructureReport, SweepReport,
+    analyze_structure, collect_structure,
+};
 mod structural_delta;
 pub use structural_delta::{
     DeltaStep, StructuralDelta, StructuralDeltaError, StructuralDeltaLimits, StructuralDeltaStats,

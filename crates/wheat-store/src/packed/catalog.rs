@@ -42,6 +42,9 @@ use crate::Durability;
 #[path = "loose_index.rs"]
 mod loose_index;
 pub(crate) use loose_index::LooseKind;
+#[path = "collect.rs"]
+mod collect;
+pub(crate) use collect::{Keep, RetiredSegments, build_collection};
 
 const SCHEMA: &str = include_str!("catalog_sql/schema.sql");
 const LOOKUP: &str = include_str!("catalog_sql/lookup.sql");
@@ -2789,6 +2792,16 @@ fn remove_unreachable_publications(
     authority: Option<&PhysicalCatalogSnapshot>,
     durability: Durability,
 ) -> Result<(), CatalogError> {
+    remove_unreachable_catalogs(catalogs, head, durability)?;
+    remove_unreachable_segments(segments, authority, durability)
+}
+
+/// Removes the catalog snapshots `head` does not name.
+fn remove_unreachable_catalogs(
+    catalogs: &Path,
+    head: CatalogHead,
+    durability: Durability,
+) -> Result<(), CatalogError> {
     let reachable_catalogs: HashSet<String> = head
         .map(|(generation, digest)| {
             [format!("{}-{}{}", generation, hex(&digest), CATALOG_SUFFIX)]
@@ -2796,12 +2809,6 @@ fn remove_unreachable_publications(
                 .collect()
         })
         .unwrap_or_default();
-    let reachable_segments: HashSet<String> = authority
-        .map_or_else(Vec::new, authority_sources)
-        .into_iter()
-        .map(|source| source.path.trim_start_matches("segments/").to_owned())
-        .collect();
-
     let mut removed_catalog = false;
     for entry in fs::read_dir(catalogs)? {
         let entry = entry?;
@@ -2833,7 +2840,20 @@ fn remove_unreachable_publications(
     if removed_catalog {
         durability.sync_directory(catalogs)?;
     }
+    Ok(())
+}
 
+/// Removes the segment files `authority` does not list.
+fn remove_unreachable_segments(
+    segments: &Path,
+    authority: Option<&PhysicalCatalogSnapshot>,
+    durability: Durability,
+) -> Result<(), CatalogError> {
+    let reachable_segments: HashSet<String> = authority
+        .map_or_else(Vec::new, authority_sources)
+        .into_iter()
+        .map(|source| source.path.trim_start_matches("segments/").to_owned())
+        .collect();
     let mut removed_segment = false;
     for entry in fs::read_dir(segments)? {
         let entry = entry?;
