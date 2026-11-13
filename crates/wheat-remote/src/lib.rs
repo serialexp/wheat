@@ -11,14 +11,13 @@ pub mod admin;
 
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header::AUTHORIZATION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 use url::{Host, Url};
 
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId, VerifiedContent};
@@ -234,9 +233,18 @@ mod url_tests {
 // Session
 // ---------------------------------------------------------------------------
 
+/// A connected byte stream a session runs over: what [`open_over`] takes from a
+/// caller that makes the connection itself.
+pub trait RemoteStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteStream for T {}
+
+/// A session's WebSocket, over whichever stream it was opened on.
+type Ws = WebSocketStream<MaybeTlsStream<Box<dyn RemoteStream>>>;
+
 /// A connected and handshaken session to a wheat-server.
 pub struct WheatSession {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: Ws,
     capabilities: Capabilities,
 }
 
@@ -322,18 +330,13 @@ fn lost(error: tokio_tungstenite::tungstenite::Error) -> ConnectionLost {
     ConnectionLost(error.to_string())
 }
 
-async fn send_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    msg: &WheatProtocolMessage,
-) -> Result<()> {
+async fn send_msg(ws: &mut Ws, msg: &WheatProtocolMessage) -> Result<()> {
     let bytes = encode_message(msg)?;
     ws.send(Message::Binary(bytes.into())).await.map_err(lost)?;
     Ok(())
 }
 
-async fn recv_msg(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> Result<WheatProtocolMessage> {
+async fn recv_msg(ws: &mut Ws) -> Result<WheatProtocolMessage> {
     loop {
         let msg = ws
             .next()
@@ -405,7 +408,25 @@ fn content_id_to_digest(id: ContentId) -> Digest256 {
 /// for none) as the upgrade request's bearer token. Returns the session and the
 /// repository's state, which the server sends once the session is established.
 pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteRepoState)> {
-    let mut session = connect(url, token).await?;
+    refuse_token_in_the_clear(url, token)?;
+    open_over(tcp_connect(url).await?, url, token).await
+}
+
+/// [`open`] over `stream`, which the caller connected to the server `url` names
+/// itself: a server fetching from an address users give it resolves and vets the
+/// name, and connects only to the address it vetted, so a name that resolves again
+/// to somewhere else is never used. Wheat does the rest as [`open`] does: TLS for
+/// `wheat+tls://`, checking the certificate against `url`'s host name rather than the
+/// address connected to, the WebSocket upgrade, and the handshake. Turn Nagle's
+/// algorithm off on a TCP stream (`set_nodelay`), or each request/reply round waits
+/// for the server's delayed ACK.
+pub async fn open_over(
+    stream: impl RemoteStream,
+    url: &WheatUrl,
+    token: &[u8],
+) -> Result<(WheatSession, RemoteRepoState)> {
+    refuse_token_in_the_clear(url, token)?;
+    let mut session = connect_over(Box::new(stream), url, token).await?;
     let state = repository_state(&mut session.ws, &url.repo_name).await?;
     Ok((session, state))
 }
@@ -414,7 +435,42 @@ pub async fn open(url: &WheatUrl, token: &[u8]) -> Result<(WheatSession, RemoteR
 /// sending `token` as the bearer token. The server refuses a principal that is not an
 /// admin with an Error message on the first request, not on connecting.
 pub async fn open_admin(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
-    connect(url, token).await
+    refuse_token_in_the_clear(url, token)?;
+    connect_over(Box::new(tcp_connect(url).await?), url, token).await
+}
+
+/// Refuses to send `token` to another machine over plain `wheat://`, where anyone on
+/// the way can read it: before connecting, so nothing is sent at all.
+fn refuse_token_in_the_clear(url: &WheatUrl, token: &[u8]) -> Result<()> {
+    if !token.is_empty() && url.scheme == "wheat" && !is_loopback(url)? {
+        bail!(
+            "refusing to send the token from credential.helper to {} over plain wheat://, \
+             where anyone on the way can read it; reach the server with a wheat+tls:// URL",
+            url.authority
+        );
+    }
+    Ok(())
+}
+
+/// A TCP connection to the server `url` names, resolving its host name, with
+/// Nagle's algorithm off: it would hold back the tail of a message until the server's
+/// delayed ACK, which costs every request/reply round tens of milliseconds.
+async fn tcp_connect(url: &WheatUrl) -> Result<TcpStream> {
+    let parsed = Url::parse(&url.ws_url).with_context(|| format!("invalid URL {}", url.ws_url))?;
+    let port = parsed
+        .port_or_known_default()
+        .with_context(|| format!("{} names no port", url.ws_url))?;
+    let connected = match parsed.host() {
+        Some(Host::Domain(domain)) => TcpStream::connect((domain, port)).await,
+        Some(Host::Ipv4(address)) => TcpStream::connect((address, port)).await,
+        Some(Host::Ipv6(address)) => TcpStream::connect((address, port)).await,
+        None => bail!("{} names no host", url.ws_url),
+    };
+    let stream = connected.with_context(|| format!("failed to connect to {}", url.ws_url))?;
+    stream
+        .set_nodelay(true)
+        .with_context(|| format!("failed to connect to {}", url.ws_url))?;
+    Ok(stream)
 }
 
 /// Whether `url`'s host is this machine, where a plain connection is not overheard.
@@ -470,16 +526,15 @@ fn tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
         .map_err(anyhow::Error::msg)
 }
 
-/// Connects to `url.ws_url` and runs the handshake up to the session being established.
-async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
+/// Runs the upgrade to `url.ws_url` over `stream`, which is connected to its server,
+/// and the handshake up to the session being established. The caller has refused a
+/// token in the clear ([`refuse_token_in_the_clear`]).
+async fn connect_over(
+    stream: Box<dyn RemoteStream>,
+    url: &WheatUrl,
+    token: &[u8],
+) -> Result<WheatSession> {
     let ws_url = url.ws_url.as_str();
-    if !token.is_empty() && url.scheme == "wheat" && !is_loopback(url)? {
-        bail!(
-            "refusing to send the token from credential.helper to {} over plain wheat://, \
-             where anyone on the way can read it; reach the server with a wheat+tls:// URL",
-            url.authority
-        );
-    }
     let connector = if url.scheme == "wheat+tls" {
         Some(Connector::Rustls(tls_config()?))
     } else {
@@ -498,13 +553,11 @@ async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
     let limits = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    // Nagle's algorithm would hold back the tail of a message until the server's
-    // delayed ACK, which costs every request/reply round tens of milliseconds.
-    let disable_nagle = true;
-    let (mut ws, _) =
-        connect_async_tls_with_config(request, Some(limits), disable_nagle, connector)
-            .await
-            .with_context(|| format!("failed to connect to {ws_url}"))?;
+    // The TLS server name, and the name the certificate is checked against, is the
+    // request's host: the URL's, whatever address the stream is connected to.
+    let (mut ws, _) = client_async_tls_with_config(request, stream, Some(limits), connector)
+        .await
+        .with_context(|| format!("failed to connect to {ws_url}"))?;
 
     // Receive ServerHello.
     let server_hello = recv_msg(&mut ws).await?;
@@ -565,10 +618,7 @@ async fn connect(url: &WheatUrl, token: &[u8]) -> Result<WheatSession> {
 }
 
 /// Reads the state of the repository `name`, which the server sends after the session.
-async fn repository_state(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-    name: &str,
-) -> Result<RemoteRepoState> {
+async fn repository_state(ws: &mut Ws, name: &str) -> Result<RemoteRepoState> {
     let msg = recv_msg(ws).await?;
     match msg {
         WheatProtocolMessage::RepositoryState(rs) => Ok(RemoteRepoState {

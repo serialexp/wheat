@@ -1260,6 +1260,17 @@ mirrors of the same move answer the same head. Bench case `mirror`: at 1,000 and
 10,000 changes, mirroring one new change reads 126 and 149 objects of the mirror's
 store. Validating the whole repository each time read 19,455 and 309,612.
 
+Gothab mirrors URLs its users type, so the connection must not be Wheat's to make
+(2026-11-14, walrus): a host's SSRF guard resolves the name, refuses private,
+loopback, link-local and metadata addresses, and connects only to the address it
+vetted. A check before Wheat resolved the name again would be open to DNS
+rebinding. `mirror::mirror_over(entry, principal, url, token, connect)` takes the
+connection from the caller's `connect(url)`; Wheat never resolves the URL. It runs
+TLS over it for `wheat+tls://`, checking the certificate against the URL's host name
+rather than the address connected to, and the rest of the session, through
+`wheat_remote::open_over(stream, url, token)`, which takes any connected
+`AsyncRead + AsyncWrite` stream. `mirror` and `open` connect as before.
+
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new
 publishes with a retryable `Error` (code 503; the CLI reports `remote_unavailable`),

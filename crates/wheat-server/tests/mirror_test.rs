@@ -17,7 +17,7 @@ use wheat_core::{
 };
 use wheat_remote::{WheatUrl, parse_wheat_url};
 use wheat_server::access::Principal;
-use wheat_server::mirror::{MirrorFailure, mirror};
+use wheat_server::mirror::{MirrorFailure, mirror, mirror_over};
 use wheat_server::naming::ContentNaming;
 use wheat_server::network::Network;
 use wheat_server::registry::{Registry, RepositoryEntry};
@@ -85,11 +85,17 @@ async fn repository() -> (Repo, LocalPublicationStore) {
 struct Upstream {
     repo: Repo,
     entry: Arc<RepositoryEntry>,
+    addr: SocketAddr,
     url: WheatUrl,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 async fn upstream() -> Upstream {
+    upstream_with(ServerConfig::new(), "wheat").await
+}
+
+/// [`upstream`], served with `config`, its URL with `scheme`.
+async fn upstream_with(config: ServerConfig, scheme: &str) -> Upstream {
     let (repo, heads) = repository().await;
     let entry = RepositoryEntry::in_network(Network::new(Box::new(repo.objects.clone())), heads);
     let registry = Arc::new(Registry::single_entry(UPSTREAM.to_string(), entry));
@@ -98,7 +104,7 @@ async fn upstream() -> Upstream {
     let (ready, ready_rx) = tokio::sync::oneshot::channel();
     let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
     tokio::spawn(async move {
-        run_until(any_port, registry, ServerConfig::new(), ready, shutdown_rx)
+        run_until(any_port, registry, config, ready, shutdown_rx)
             .await
             .unwrap();
     });
@@ -106,7 +112,8 @@ async fn upstream() -> Upstream {
     Upstream {
         repo,
         entry,
-        url: parse_wheat_url(&format!("wheat://{addr}/{UPSTREAM}")).unwrap(),
+        addr,
+        url: parse_wheat_url(&format!("{scheme}://{addr}/{UPSTREAM}")).unwrap(),
         _shutdown: shutdown,
     }
 }
@@ -431,4 +438,138 @@ async fn two_mirrors_of_the_same_move_answer_the_same_head() {
     assert_eq!(first.head, second.head);
     assert_eq!(first.head, head(&mirror_repo.entry).await);
     assert_eq!(first.head.generation, before.generation + 1, "moved once");
+}
+/// `url` with its authority replaced by `authority`.
+fn at(url: &WheatUrl, scheme: &str, authority: &str) -> WheatUrl {
+    parse_wheat_url(&format!("{scheme}://{authority}/{}", url.repo_name)).unwrap()
+}
+
+#[tokio::test]
+async fn a_mirror_over_the_callers_connection_never_resolves_the_url() {
+    let upstream = upstream().await;
+    commit(
+        &upstream.entry,
+        1,
+        upstream.repo.base,
+        Absent,
+        "one.txt",
+        b"one",
+    )
+    .await;
+    let mirror_repo = mirror_repository().await;
+    // `.invalid` never resolves: only the caller's connection reaches the server.
+    let url = at(
+        &upstream.url,
+        "wheat",
+        &format!("upstream.invalid:{}", upstream.addr.port()),
+    );
+    let asked = Arc::new(Mutex::new(None));
+    let (addr, record) = (upstream.addr, Arc::clone(&asked));
+
+    let mirrored = mirror_over(
+        &mirror_repo.entry,
+        &principal(),
+        &url,
+        b"",
+        move |url| async move {
+            *record.lock().unwrap() = Some(url);
+            tokio::net::TcpStream::connect(addr).await
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(mirrored.moved);
+    assert_eq!(mirrored.head.envelope, head(&upstream.entry).await.envelope);
+    assert_eq!(asked.lock().unwrap().as_ref(), Some(&url));
+}
+
+#[tokio::test]
+async fn a_connection_the_caller_refuses_leaves_the_head() {
+    let upstream = upstream().await;
+    let mirror_repo = mirror_repository().await;
+    let before = head(&mirror_repo.entry).await;
+
+    let failure = mirror_over(
+        &mirror_repo.entry,
+        &principal(),
+        &upstream.url,
+        b"",
+        |_| async {
+            Err::<tokio::net::TcpStream, _>(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "resolves to a private address",
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match failure {
+        MirrorFailure::Remote(message) => {
+            assert!(
+                message.contains("resolves to a private address"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(&mirror_repo.entry).await, before);
+}
+
+#[tokio::test]
+async fn over_tls_the_certificate_is_checked_against_the_urls_host_not_the_address() {
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert, generated.cert.pem()).unwrap();
+    std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+    // SAFETY: nextest runs each test in a process of its own, and nothing else in
+    // this one reads the environment yet: the client reads its roots on first use.
+    unsafe { std::env::set_var("SSL_CERT_FILE", &cert) };
+    let mut config = ServerConfig::new();
+    config.tls = Some(wheat_server::tls::load_pem(&cert, &key).unwrap());
+    let upstream = upstream_with(config, "wheat+tls").await;
+    let one = commit(
+        &upstream.entry,
+        1,
+        upstream.repo.base,
+        Absent,
+        "one.txt",
+        b"one",
+    )
+    .await;
+    let mirror_repo = mirror_repository().await;
+    let addr = upstream.addr;
+    let to_server = move |_| async move { tokio::net::TcpStream::connect(addr).await };
+
+    // Connected to 127.0.0.1, the certificate for `localhost` is the URL host's.
+    let localhost = at(
+        &upstream.url,
+        "wheat+tls",
+        &format!("localhost:{}", addr.port()),
+    );
+    let mirrored = mirror_over(&mirror_repo.entry, &principal(), &localhost, b"", to_server)
+        .await
+        .unwrap();
+    assert_eq!(mirrored.head.envelope, head(&upstream.entry).await.envelope);
+
+    // The same connection, for a URL naming another host, fails the check.
+    commit(&upstream.entry, 2, one, View(one), "two.txt", b"two").await;
+    let elsewhere = at(
+        &upstream.url,
+        "wheat+tls",
+        &format!("upstream.invalid:{}", addr.port()),
+    );
+    let failure = mirror_over(&mirror_repo.entry, &principal(), &elsewhere, b"", to_server)
+        .await
+        .unwrap_err();
+    match failure {
+        MirrorFailure::Remote(message) => assert!(
+            message.contains("certificate not valid for name \"upstream.invalid\""),
+            "{message}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(&mirror_repo.entry).await, mirrored.head);
 }
