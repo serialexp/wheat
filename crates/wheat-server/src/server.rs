@@ -59,7 +59,8 @@ pub struct ServerConfig {
     /// with `wheat+tls://` ([`crate::tls::load_pem`]). `None` serves plain
     /// WebSockets, for loopback or behind a proxy that ends TLS. The handshake counts
     /// against [`Self::session_setup_timeout`]. An embedder that does its own upgrade
-    /// does its own TLS.
+    /// does its own TLS. Only with the `tls` feature.
+    #[cfg(feature = "tls")]
     pub tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
@@ -79,6 +80,7 @@ impl ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             publish_hooks: None,
             exchange_dir: None,
+            #[cfg(feature = "tls")]
             tls: None,
         }
     }

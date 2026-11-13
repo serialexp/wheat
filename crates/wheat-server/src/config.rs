@@ -5,13 +5,13 @@
 //! server runs open and loopback-only, and the `[limits]` table.
 
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::access::AuthConfig;
 
 /// Largest config file the server will read.
+#[cfg(feature = "config-file")]
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// The whole config file.
@@ -38,6 +38,9 @@ pub struct LimitsConfig {
     pub max_connections: Option<NonZeroUsize>,
 }
 
+/// Reading the file needs the `config-file` feature; an embedder without it builds
+/// a [`FileConfig`] from its own configuration.
+#[cfg(feature = "config-file")]
 impl FileConfig {
     /// Parse config file text.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -45,7 +48,7 @@ impl FileConfig {
     }
 
     /// Read and parse a config file.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
         let length = std::fs::metadata(path)
             .map_err(|e| ConfigError(format!("read {}: {e}", path.display())))?
             .len();

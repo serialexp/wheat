@@ -34,6 +34,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # wheat-server as a library, without the binary's dependencies, as Gothab
+      # embeds it. The workspace build above always has the default features on.
+      - run: cargo clippy -p wheat-server --lib --no-default-features --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest

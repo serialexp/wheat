@@ -5,34 +5,52 @@ edition = "2024"
 autotests = false
 
 [features]
+default = ["standalone"]
 # `heads::conformance`, a check an embedder runs against its own head store.
 conformance = []
+# TLS on the connections `server::run` accepts (`tls`, `ServerConfig::tls`). An
+# embedder that does its own HTTP upgrade does its own TLS and leaves this out.
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls"]
+# Reading the standalone server's TOML config file (`config::FileConfig::parse`).
+config-file = ["dep:toml"]
+# The `wheat-server` binary: everything above, plus its command line, allocator and
+# log output. An embedder using the crate as a library sets `default-features = false`.
+standalone = [
+    "tls",
+    "config-file",
+    "dep:clap",
+    "dep:mimalloc",
+    "dep:tracing-subscriber",
+    "dep:wheat-trace",
+    "tokio/signal",
+]
 
 [[bin]]
 name = "wheat-server"
 path = "src/main.rs"
+required-features = ["standalone"]
 
 [dependencies]
 async-trait = "0.1"
 blake3 = { workspace = true }
 bytes = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 futures = "0.3"
-mimalloc = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rustls-pki-types = { version = "1", features = ["std"] }
+mimalloc = { workspace = true, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "io-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"], optional = true }
 tokio-tungstenite = "0.28"
-toml = "1"
+toml = { version = "1", optional = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-protocol = { path = "../wheat-protocol" }
 wheat-store = { path = "../wheat-store" }
-wheat-trace = { path = "../wheat-trace" }
+wheat-trace = { path = "../wheat-trace", optional = true }
 
 [dev-dependencies]
 futures = "0.3"
@@ -41,7 +59,7 @@ tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
 # The integration tests run the conformance check against Wheat's own head stores.
-wheat-server = { path = ".", features = ["conformance"] }
+wheat-server = { path = ".", features = ["conformance", "standalone"] }
 
 [lints]
 workspace = true

@@ -68,6 +68,9 @@ pub async fn handle_connection(
         .unwrap_or_else(|_| "unknown".into());
     debug!(peer = %peer, "new connection");
     let deadline = Instant::now() + config.session_setup_timeout;
+    #[cfg(not(feature = "tls"))]
+    upgrade_and_serve(stream, &registry, &config, &peer, deadline).await;
+    #[cfg(feature = "tls")]
     match &config.tls {
         None => upgrade_and_serve(stream, &registry, &config, &peer, deadline).await,
         Some(tls) => match timeout_at(deadline, tls.accept(stream)).await {

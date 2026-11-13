@@ -4,6 +4,11 @@
 //! fetch and publish protocol from `wheat-protocol`. Each repository is
 //! backed by a local `PackedObjectStore` (or a remote packed store) and a
 //! [`heads::HeadStore`], by default a `LocalPublicationStore`.
+//!
+//! The default `standalone` feature builds the `wheat-server` binary, with its
+//! command line, allocator, log output, TLS (`tls`) and config file (`config-file`).
+//! An embedder that serves repositories inside its own process sets
+//! `default-features = false` and turns on only what it uses.
 
 /// The attribute that implements [`access::AccessProvider`] and
 /// [`hooks::PublishHooks`], so an embedder needs no version of its own.
@@ -26,6 +31,7 @@ pub mod quiesce;
 pub mod receipt;
 pub mod registry;
 pub mod server;
+#[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;
 pub mod wire;

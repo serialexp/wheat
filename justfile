@@ -13,9 +13,11 @@ check:
 check-windows:
     RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 
-# Lint every crate and target; warnings fail.
+# Lint every crate and target; warnings fail. Then wheat-server as an embedder
+# builds it, without default features, which the workspace build always turns on.
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p wheat-server --lib --no-default-features -- -D warnings
 
 # Build the API docs; warnings (such as a public item linking a private one) fail.
 doc:
