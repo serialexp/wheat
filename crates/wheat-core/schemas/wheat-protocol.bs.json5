@@ -599,9 +599,9 @@
       ],
     },
 
-    // Counts what a repository's network holds that no repository of it reaches: the
-    // garbage every publish leaves behind. Only a dry run exists so far; it deletes
-    // nothing and holds no publishes.
+    // Removes what a repository's network holds that no repository of it reaches: the
+    // garbage every publish leaves behind, with the network's publishes held. A dry run
+    // only counts it, and holds no publishes.
     AdminGcCommand: {
       sequence: [
         { name: "command_kind", type: "uint8", const: 5 },

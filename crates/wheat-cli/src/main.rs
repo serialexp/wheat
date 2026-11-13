@@ -374,13 +374,14 @@ enum AdminAction {
         /// The repository's name, as `owner/repo`.
         name: String,
     },
-    /// Count what the repository's network holds that no head of it reaches: the
-    /// garbage every publish leaves. Only a dry run exists so far.
+    /// Remove what the repository's network holds that no head of it reaches: the
+    /// garbage every publish leaves. Publishes to the network wait meanwhile; fetches
+    /// go on. Each head is validated first, and nothing is removed if one fails.
     Gc {
         /// A repository of the network, as `owner/repo`.
         repository: String,
-        /// Count the garbage and delete nothing (required until collecting exists).
-        #[arg(long, required = true)]
+        /// Count the garbage and delete nothing; publishes go on.
+        #[arg(long)]
         dry_run: bool,
     },
 }
@@ -943,7 +944,13 @@ fn admin(arguments: AdminArgs) -> Result<Success> {
         },
         AdminAction::Adopt { source, name } => Operation::Adopt { source, name },
         AdminAction::Delete { repository } => Operation::Delete { repository },
-        AdminAction::Gc { repository, .. } => Operation::GcDryRun { repository },
+        AdminAction::Gc {
+            repository,
+            dry_run,
+        } => Operation::Gc {
+            repository,
+            dry_run,
+        },
     };
     let url = remote::parse_admin_url(&arguments.server)?;
     let token = credential::token_for(&UserConfig::from_environment()?, None, &url)?;

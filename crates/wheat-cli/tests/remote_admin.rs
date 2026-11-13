@@ -374,9 +374,10 @@ fn deleting_a_served_repository_ends_a_move() {
     assert!(stderr.contains("no such repository"), "{stderr}");
 }
 /// A dry run counts the objects of superseded publishes that no head reaches, and
-/// changes nothing: the repository serves the same afterwards.
+/// changes nothing; the collection removes them, and the repository serves the same
+/// afterwards.
 #[test]
-fn a_dry_run_counts_what_publishes_left_unreachable() {
+fn gc_removes_what_publishes_left_unreachable() {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("config");
     write_config(&config);
@@ -392,9 +393,6 @@ fn a_dry_run_counts_what_publishes_left_unreachable() {
     }
 
     let gc = ["admin", "--server", &url, "gc", "team/repo"];
-    // Collecting is not there yet: the flag is required.
-    fails(root.path(), &stores, &config, &gc);
-
     let counted = ok_json(
         root.path(),
         &stores,
@@ -421,4 +419,31 @@ fn a_dry_run_counts_what_publishes_left_unreachable() {
     );
     assert_eq!(again["message"], counted["message"]);
     assert!(repos.join("networks").is_dir());
+
+    let collected = ok_json(root.path(), &stores, &config, &gc);
+    let message = collected["message"].as_str().unwrap();
+    assert!(message.contains("1 heads validated"), "{message}");
+    assert!(!message.contains(", 0 objects ("), "{message}");
+    let after = ok_json(
+        root.path(),
+        &stores,
+        &config,
+        &[gc.as_slice(), &["--dry-run"]].concat(),
+    );
+    let message = after["message"].as_str().unwrap();
+    assert!(
+        message
+            .lines()
+            .any(|line| line.contains("are reached by none") && line.contains("; 0 objects")),
+        "the collection left garbage: {message}"
+    );
+    // The repository serves what it did, and takes publishes again.
+    let fresh = clone(root.path(), &config, &format!("{url}/team/repo"), "fresh");
+    for name in ["one", "two", "three"] {
+        assert_eq!(
+            fs::read_to_string(fresh.0.join(format!("{name}.txt"))).unwrap(),
+            name
+        );
+    }
+    publish(&config, &workspace, "four");
 }

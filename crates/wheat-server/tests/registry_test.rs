@@ -237,6 +237,48 @@ async fn quiescing_a_repository_holds_its_whole_network() {
     assert!(!fork.network.is_quiesced());
 }
 
+/// Pool GC runs only under a hold on the network it collects.
+#[tokio::test]
+async fn a_collection_needs_a_hold_on_its_own_network() {
+    let repos = tempfile::tempdir().unwrap();
+    let (_, head) = create(repos.path(), "alice/repo").await;
+    create(repos.path(), "carol/other").await;
+    let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
+    let alice = registry.get("alice/repo").await.unwrap().unwrap();
+
+    let other = registry.quiesce("carol/other").await.unwrap().unwrap();
+    let refused = alice
+        .network
+        .collect_structure(
+            &other,
+            vec![head.envelope],
+            wheat_store::SnapshotLimits::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(wheat_server::network::NetworkCollectionError::NotHeld)
+        ),
+        "{refused:?}"
+    );
+    drop(other);
+
+    let held = registry.quiesce("alice/repo").await.unwrap().unwrap();
+    let collection = alice
+        .network
+        .collect_structure(
+            &held,
+            vec![head.envelope],
+            wheat_store::SnapshotLimits::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collection.roots, 1);
+    drop(held);
+    assert_eq!(alice.heads.head().await.unwrap(), head);
+}
+
 #[tokio::test]
 async fn content_is_kept_once_for_every_network_of_the_directory() {
     let repos = tempfile::tempdir().unwrap();

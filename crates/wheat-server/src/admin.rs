@@ -173,6 +173,10 @@ enum Job {
     GcDryRun {
         repository: String,
     },
+    /// Removes the garbage in the repository's network.
+    Gc {
+        repository: String,
+    },
 }
 
 /// Starts `command` on a task of its own and returns its operation ID. The caller has
@@ -232,9 +236,9 @@ fn parse(exchange: Option<&Path>, command: AdminCommand) -> Result<Job, StartErr
         AdminCommand::AdminGcCommand(command) if command.dry_run => Ok(Job::GcDryRun {
             repository: command.repository,
         }),
-        AdminCommand::AdminGcCommand(_) => Err(StartError::Unsupported(
-            "collecting garbage is not available yet; ask for a dry run",
-        )),
+        AdminCommand::AdminGcCommand(command) => Ok(Job::Gc {
+            repository: command.repository,
+        }),
     }
 }
 
@@ -302,6 +306,7 @@ async fn run(
             Ok(format!("deleted {repository}\n"))
         }
         Job::GcDryRun { repository } => gc_dry_run(registry, &directory, &repository, &phase).await,
+        Job::Gc { repository } => gc(registry, &directory, &repository, &phase).await,
         Job::Adopt { source, name } => {
             phase("adopting");
             let content = directory.content.content_store();
@@ -332,29 +337,10 @@ async fn export(
     phase: &(dyn Fn(&str) + Sync),
 ) -> Result<String, String> {
     let repositories = directory.repositories.clone();
-    let located = {
-        let repositories = repositories.clone();
-        let repository = repository.to_owned();
-        spawn_blocking(move || repositories.locate(&repository))
-            .await
-            .map_err(|error| chain(&error))?
-            .map_err(|error| chain(&error))?
-    };
-    let Some(location) = located else {
-        return Err(format!("there is no repository {repository}"));
-    };
+    let location = locate(directory, repository).await?;
 
     phase("holding the network still");
-    let held = tokio::time::timeout(QUIESCE_WAIT, registry.quiesce(repository))
-        .await
-        .map_err(|_| {
-            format!(
-                "publishes to {repository} did not finish within {} seconds",
-                QUIESCE_WAIT.as_secs()
-            )
-        })?
-        .map_err(|error| chain(&error))?
-        .ok_or_else(|| format!("there is no repository {repository}"))?;
+    let held = quiesce(registry, repository).await?;
     phase("copying the structure");
     let export = {
         let repositories = repositories.clone();
@@ -410,16 +396,7 @@ async fn gc_dry_run(
     repository: &str,
     phase: &(dyn Fn(&str) + Sync),
 ) -> Result<String, String> {
-    let repositories = directory.repositories.clone();
-    let located = {
-        let repositories = repositories.clone();
-        let repository = repository.to_owned();
-        spawn_blocking(move || repositories.locate(&repository))
-            .await
-            .map_err(|error| chain(&error))?
-            .map_err(|error| chain(&error))?
-    }
-    .ok_or_else(|| format!("there is no repository {repository}"))?;
+    let located = locate(directory, repository).await?;
     // The entry keeps the network's store open for as long as it is held.
     let entry = registry
         .get(repository)
@@ -428,26 +405,7 @@ async fn gc_dry_run(
         .ok_or_else(|| format!("there is no repository {repository}"))?;
 
     phase("reading the heads");
-    // Every head of the network is a root, named or not.
-    let heads = {
-        let network = repositories.network(located.network);
-        spawn_blocking(move || {
-            network
-                .repositories()?
-                .into_iter()
-                .map(|id| {
-                    network
-                        .publications(id)
-                        .read()
-                        .map(|head| head.envelope)
-                        .map_err(|error| std::io::Error::other(error.to_string()))
-                })
-                .collect::<std::io::Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|error| chain(&error))?
-        .map_err(|error| chain(&error))?
-    };
+    let heads = network_heads(directory, located.network).await?;
 
     phase("walking the heads");
     let report = entry
@@ -460,6 +418,101 @@ async fn gc_dry_run(
         "network {} (dry run: nothing was changed)\n{report}",
         located.network
     ))
+}
+
+/// Removes what the network of `repository` holds that no head of it reaches. Holds
+/// the network's publishes from before the heads are read until the sweep is done;
+/// fetches go on, reading what they began with.
+async fn gc(
+    registry: &Arc<Registry>,
+    directory: &DirectoryHandle,
+    repository: &str,
+    phase: &(dyn Fn(&str) + Sync),
+) -> Result<String, String> {
+    let located = locate(directory, repository).await?;
+
+    phase("holding the network still");
+    let held = quiesce(registry, repository).await?;
+    phase("reading the heads");
+    let heads = network_heads(directory, located.network).await?;
+    // Publishes refused meanwhile are told how long the collection should take: a
+    // read of the network's files for each head's validation and for the marking.
+    let sized = {
+        let network = directory.repositories.network(located.network);
+        spawn_blocking(move || network.files())
+            .await
+            .map_err(|error| chain(&error))?
+    };
+    if let Ok(files) = sized {
+        let bytes: u64 = files.iter().map(|file| file.len).sum();
+        let reads = u64::try_from(heads.len() + 1).unwrap_or(u64::MAX);
+        held.expect(copy_estimate(bytes.saturating_mul(reads)));
+    }
+
+    phase("validating each head, marking and sweeping");
+    let network = held.entry().network.clone();
+    let collection = network
+        .collect_structure(&held, heads, SnapshotLimits::default())
+        .await
+        .map_err(|error| chain(&error))?;
+    drop(held);
+    Ok(format!("network {}\n{collection}", located.network))
+}
+
+/// The network and repository the name `repository` refers to.
+async fn locate(
+    directory: &DirectoryHandle,
+    repository: &str,
+) -> Result<wheat_core::RepositoryLocationRecord, String> {
+    let repositories = directory.repositories.clone();
+    let name = repository.to_owned();
+    spawn_blocking(move || repositories.locate(&name))
+        .await
+        .map_err(|error| chain(&error))?
+        .map_err(|error| chain(&error))?
+        .ok_or_else(|| format!("there is no repository {repository}"))
+}
+
+/// Refuses new publishes to the network of `repository` and waits for those writing
+/// to it to finish.
+async fn quiesce(
+    registry: &Registry,
+    repository: &str,
+) -> Result<crate::quiesce::Quiesced, String> {
+    tokio::time::timeout(QUIESCE_WAIT, registry.quiesce(repository))
+        .await
+        .map_err(|_| {
+            format!(
+                "publishes to {repository} did not finish within {} seconds",
+                QUIESCE_WAIT.as_secs()
+            )
+        })?
+        .map_err(|error| chain(&error))?
+        .ok_or_else(|| format!("there is no repository {repository}"))
+}
+
+/// The head of every repository of `network`, named or not: the roots of its GC.
+async fn network_heads(
+    directory: &DirectoryHandle,
+    network: Uuid,
+) -> Result<Vec<wheat_core::RepositoryEnvelopeId>, String> {
+    let network = directory.repositories.network(network);
+    spawn_blocking(move || {
+        network
+            .repositories()?
+            .into_iter()
+            .map(|id| {
+                network
+                    .publications(id)
+                    .read()
+                    .map(|head| head.envelope)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|error| chain(&error))?
+    .map_err(|error| chain(&error))
 }
 
 /// How long copying `bytes` of a network's files is expected to take, for the clients

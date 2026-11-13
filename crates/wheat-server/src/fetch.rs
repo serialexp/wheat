@@ -5,8 +5,8 @@ use tracing::{Instrument as _, debug};
 use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_protocol::*;
 use wheat_store::{
-    DeltaStep, ImmutableObjectStore, ObjectKind, ObjectStoreError, StoredObject, StructuralDelta,
-    StructuralDeltaLimits,
+    CollectableStructure, DeltaStep, ImmutableObjectStore, ObjectKind, ObjectStoreError,
+    PinnedObjects, StoredObject, StructuralDelta, StructuralDeltaLimits,
 };
 
 use crate::blocking::drive;
@@ -34,6 +34,9 @@ const INTERNAL: u16 = 500;
 ///
 /// Any envelope in this repository's store may be fetched. A `since` envelope the
 /// store does not have is ignored, and everything is pushed.
+///
+/// The fetch reads the store as it was when the fetch began: what a pool GC sweeping
+/// meanwhile removes stays readable to it ([`CollectableStructure::pin`]).
 pub async fn handle_fetch(
     ws: &mut impl Transport,
     entry: &RepositoryEntry,
@@ -42,11 +45,21 @@ pub async fn handle_fetch(
     let op_id = req.op_id;
     let want = digest_to_object_id(&req.want_envelope)?;
     let since = digest_to_object_id(&req.since_envelope)?;
-    let network = entry.network.clone();
-    let (has_want, has_since) = drive(move || async move {
-        let has_want = is_envelope(&network.store, want).await?;
-        let has_since = *since.as_bytes() != [0; 32] && is_envelope(&network.store, since).await?;
-        Ok::<_, ConnectionError>((has_want, has_since))
+    let objects = PinnedObjects::new(
+        entry.network.clone(),
+        entry
+            .network
+            .store
+            .collectable_structure()
+            .map(CollectableStructure::pin),
+    );
+    let (has_want, has_since) = drive({
+        let objects = objects.clone();
+        move || async move {
+            let has_want = is_envelope(&objects, want).await?;
+            let has_since = *since.as_bytes() != [0; 32] && is_envelope(&objects, since).await?;
+            Ok::<_, ConnectionError>((has_want, has_since))
+        }
     })
     .await??;
     if !has_want {
@@ -57,7 +70,7 @@ pub async fn handle_fetch(
     let want = RepositoryEnvelopeId::from_digest(*want.as_bytes());
     debug!(op_id, %want, incremental = since.is_some(), "fetch: starting");
 
-    let Some(pushed) = push(ws, entry, op_id, since, want).await? else {
+    let Some(pushed) = push(ws, &objects, op_id, since, want).await? else {
         return Ok(());
     };
     send(
@@ -85,7 +98,7 @@ pub async fn handle_fetch(
                     );
                     return fetch_error(ws, op_id, BAD_REQUEST, &message).await;
                 }
-                if !answer_want(ws, entry, op_id, &wanted).await? {
+                if !answer_want(ws, &objects, op_id, &wanted).await? {
                     return Ok(());
                 }
                 next_want += 1;
@@ -128,6 +141,9 @@ async fn is_envelope<S: ImmutableObjectStore + ?Sized>(
 /// Each is at most one batch, so this bounds what a slow client makes the server hold.
 const PUSH_QUEUE: usize = 2;
 
+/// The network's store as a fetch reads it: pinned when the fetch began.
+type FetchObjects = PinnedObjects<Network>;
+
 /// What the walk hands the connection to send.
 enum Pushed {
     Message(WheatProtocolMessage),
@@ -143,16 +159,16 @@ enum Pushed {
 #[tracing::instrument(name = "fetch_push", level = "debug", skip_all)]
 async fn push(
     ws: &mut impl Transport,
-    entry: &RepositoryEntry,
+    objects: &FetchObjects,
     op_id: u64,
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
 ) -> Result<Option<u64>, ConnectionError> {
     let (sender, mut queue) = tokio::sync::mpsc::channel(PUSH_QUEUE);
-    let network = entry.network.clone();
+    let objects = objects.clone();
     let span = tracing::debug_span!("fetch_walk");
     let walk = drive(move || {
-        async move { walk(&network, op_id, since, want, &sender).await }.instrument(span)
+        async move { walk(&objects, op_id, since, want, &sender).await }.instrument(span)
     });
     // Polled with the queue, so the walk's result arrives without a task of its own.
     tokio::pin!(walk);
@@ -184,18 +200,13 @@ async fn push(
 /// The walk from `since` to `want`, run on a thread for blocking work: groups what
 /// it finds into messages for `sender`. Returns how many objects it pushed.
 async fn walk(
-    network: &Network,
+    objects: &FetchObjects,
     op_id: u64,
     since: Option<RepositoryEnvelopeId>,
     want: RepositoryEnvelopeId,
     sender: &tokio::sync::mpsc::Sender<Pushed>,
 ) -> Result<u64, ConnectionError> {
-    let mut delta = StructuralDelta::new(
-        &network.store,
-        since,
-        want,
-        StructuralDeltaLimits::default(),
-    );
+    let mut delta = StructuralDelta::new(objects, since, want, StructuralDeltaLimits::default());
     let mut batch = BatchSender::new(op_id);
     let mut ready = Vec::new();
     let mut pushed = 0u64;
@@ -323,7 +334,7 @@ fn object_chunks(op_id: u64, object: &StoredObject) -> impl Iterator<Item = Whea
 #[tracing::instrument(name = "fetch_answer_want", level = "debug", skip_all)]
 async fn answer_want(
     ws: &mut impl Transport,
-    entry: &RepositoryEntry,
+    objects: &FetchObjects,
     op_id: u64,
     wanted: &ObjectWantOutput,
 ) -> Result<bool, ConnectionError> {
@@ -332,8 +343,8 @@ async fn answer_want(
         .iter()
         .map(digest_to_object_id)
         .collect::<Result<Vec<_>, _>>()?;
-    let network = entry.network.clone();
-    let answer = drive(move || async move { read_want(&network, &ids).await }).await??;
+    let objects = objects.clone();
+    let answer = drive(move || async move { read_want(&objects, &ids).await }).await??;
     if let Some(object) = &answer.chunked {
         for chunk in object_chunks(op_id, object) {
             send(ws, &chunk).await?;
@@ -369,7 +380,10 @@ struct WantAnswer {
 }
 
 /// Reads the wanted objects from the front of `ids` that fit in one reply.
-async fn read_want(network: &Network, ids: &[ObjectId]) -> Result<WantAnswer, ConnectionError> {
+async fn read_want(
+    objects: &FetchObjects,
+    ids: &[ObjectId],
+) -> Result<WantAnswer, ConnectionError> {
     let mut answer = WantAnswer {
         chunked: None,
         objects: Vec::new(),
@@ -377,7 +391,7 @@ async fn read_want(network: &Network, ids: &[ObjectId]) -> Result<WantAnswer, Co
     };
     let mut bytes = 0;
     for (index, &id) in ids.iter().enumerate() {
-        let object = match network.store.get(id).await {
+        let object = match objects.get(id).await {
             Ok(object) => object,
             Err(ObjectStoreError::Missing(_)) => {
                 answer.missing = Some(id);

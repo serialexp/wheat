@@ -19,13 +19,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use async_trait::async_trait;
 use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_store::{
-    ContentItem, ContentStore, ImmutableObjectStore, ObjectStoreError, RepositoryStore,
-    RepositoryStoreError, SnapshotError, SnapshotLimits, StoredInventory, StoredObject,
-    StoredWrite, StructureReport, analyze_structure,
+    CollectableStructure, ContentItem, ContentStore, ImmutableObjectStore, ObjectStoreError,
+    RepositoryStore, RepositoryStoreError, SnapshotError, SnapshotLimits, StoredInventory,
+    StoredObject, StoredWrite, StructureCollection, StructureCollectionError, StructureReport,
+    analyze_structure, collect_structure,
 };
 
 use crate::naming::ContentNaming;
-use crate::quiesce::Writers;
+use crate::quiesce::{Quiesced, Writers};
 
 /// A fork network's stores, shared by the repositories of it that are open.
 #[derive(Clone)]
@@ -40,6 +41,67 @@ impl Network {
     /// As [`Self::new`], telling `naming` the content each publish relies on.
     pub fn with_naming(store: Box<dyn RepositoryStore>, naming: Arc<dyn ContentNaming>) -> Self {
         Self(Arc::new(NetworkStores::new(store, Some(naming), None)))
+    }
+}
+
+impl Network {
+    /// Removes from the network's store every object none of `heads` reaches: pool GC
+    /// (see [`wheat_store::collect_structure`]). `heads` is the head of every
+    /// repository of the network, named or not, read while `held` holds it.
+    ///
+    /// `held` is a hold on a repository of this network ([`Registry::quiesce`] or
+    /// [`Quiesced::hold`]), kept from before the heads were read: a publish's objects
+    /// are stored before a head names them, so one let in meanwhile could lose them.
+    /// Fetches go on, reading the store as it was when they began. Runs on a thread for
+    /// blocking work.
+    pub async fn collect_structure(
+        &self,
+        held: &Quiesced,
+        heads: Vec<RepositoryEnvelopeId>,
+        limits: SnapshotLimits,
+    ) -> Result<StructureCollection, NetworkCollectionError> {
+        if !std::ptr::eq::<NetworkStores>(&*held.entry().network, &**self) {
+            return Err(NetworkCollectionError::NotHeld);
+        }
+        let network = self.clone();
+        crate::blocking::drive(move || async move {
+            collect_structure(&network.store, &heads, limits).await
+        })
+        .await
+        .map_err(NetworkCollectionError::Stopped)?
+        .map_err(NetworkCollectionError::Collection)
+    }
+}
+
+/// Why [`Network::collect_structure`] removed nothing.
+#[derive(Debug)]
+pub enum NetworkCollectionError {
+    /// The hold given is on another network.
+    NotHeld,
+    Collection(StructureCollectionError),
+    /// The collection's thread panicked.
+    Stopped(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for NetworkCollectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotHeld => f.write_str(
+                "the hold is on another network: hold a repository of the one collected",
+            ),
+            Self::Collection(error) => error.fmt(f),
+            Self::Stopped(error) => write!(f, "the collection stopped: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for NetworkCollectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotHeld => None,
+            Self::Collection(error) => error.source(),
+            Self::Stopped(error) => Some(error),
+        }
     }
 }
 
@@ -100,6 +162,10 @@ impl RepositoryStore for Network {
 
     fn structural_inventory(&self) -> Option<&dyn StoredInventory> {
         self.store.structural_inventory()
+    }
+
+    fn collectable_structure(&self) -> Option<&dyn CollectableStructure> {
+        self.store.collectable_structure()
     }
 }
 

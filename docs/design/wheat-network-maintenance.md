@@ -1,9 +1,10 @@
 # Wheat network maintenance: moving networks and collecting garbage — Design
 
 Status: partial — Phase 0 (the admin surface), Phases 1 (export), 2 (import and
-adoption) and 3 (delete while served) landed, so a network can be moved, and Phase 4a (the pool GC
-dry run, 2026-11-12); Phase 2b and the collections (4b–6) are designed, not yet
-implemented; Gothab's content GC (2026-11-06) is built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
+adoption) and 3 (delete while served) landed, so a network can be moved, and Phases 4a (the pool GC
+dry run, 2026-11-12) and 4b (the pool's objects collected, 2026-11-13); Phase 2b, dropping
+the pool's content records (review change 6) and the content collections (5–6) are designed,
+not yet implemented; Gothab's content GC (2026-11-06) is built on Wheat's side (marking, sweeping, and naming what publishes rely on), with
 two gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
@@ -49,6 +50,48 @@ and move them from Outstanding to Done.
   SQLite writes were grouped into transactions of 4,096 objects) and peak RSS stays
   150 MiB. Bench case `structure_gc`, results under `bench/results/wheat-quick/`. The
   binschema pin in the generator scripts moved to b85ce74 with it.
+- [x] **Phase 4b — pool GC, the collection of objects (2026-11-13).**
+  `collect_structure` (`wheat-store/src/structure_gc.rs`) validates each head completely
+  (`validate_envelope`, Bart 2026-11-12), walks them to mark with the marks on disk
+  (`ObjectMarks`, the walk's SQLite), and sweeps through `CollectableStructure`, which
+  `PackedObjectStore` implements and `RepositoryStore::collectable_structure` exposes. It
+  fails closed, removing nothing, on no heads, a head that does not validate, a store that
+  cannot collect, or a catalog written to while the replacement was built.
+  The sweep (`packed/sweep.rs`, `packed/collect.rs`, review change 7) seals the active
+  segment and captures the sealed ones under the catalog's lock, copies the marked
+  objects and every content record into new segments without the lock (one segment's
+  index and one record at a time; a record two segments hold is copied once, through a
+  `copied` table beside the marks), and takes the lock only to publish through the same
+  `repack.intent` a repack uses. Unmarked loose objects are moved into
+  `<store>/retired/sweep-*` and settled in the catalog's loose index. Delta records are
+  copied resolved, whole.
+  Reader grace (question 8 option A; Bart 2026-11-12, "pinned catalog views"): a reader
+  takes a `StorePin` and reads through `PinnedObjects`; a sweep hands the replaced
+  segments' readers and the retired loose directory to the epoch the pins hold, and their
+  files go when the last pin taken before the sweep drops. A reader that misses an object
+  while a sweep is publishing waits for the epoch's retired store rather than finding
+  nothing. Opening a store removes `retired/` and the segment files no catalog names, so
+  a crash leaves nothing behind; a store copy skips `retired/` (`packed/files.rs`).
+  wheat-server's fetch pins when it begins (`fetch.rs`). The embedder's call is
+  `Network::collect_structure(&Quiesced, heads, limits)`, refused with `NotHeld` for a
+  hold on another network, run on a blocking thread; `wheat admin gc <repository>`
+  (without `--dry-run`) quiesces the network, reads every head file of it, sets the
+  retry estimate to a read of the network's files per head plus one, and collects.
+  Tests: `wheat-store/tests/structure_gc.rs` (collection, pins, loose retirement,
+  reopening after a crash with a pin held, failing closed), `packed/catalog_tests.rs`
+  (keep/drop/duplicate, stale authority), `registry_test.rs` (the hold check),
+  `remote_admin.rs` (`gc_removes_what_publishes_left_unreachable`, end to end).
+  Bench case `structure_gc` at 10,000 changes plus 20 forks: 156,847 of 347,854 objects
+  removed, 578 MB of segments replaced by 272 MB (1.0065 bytes written per kept
+  canonical byte; budget 1.02); 6,091,607 objects read, within the budget of one
+  complete validation per head (280,989 for a fork's head) plus the marking walk
+  (191,007). The network is held for 400 s, of which about 335 s are the 21 validations
+  (16 s each), 7 s the marking and about 58 s the sweep; peak RSS 400 MiB.
+  Limits: a fetch that began after the sweep and wants a superseded envelope still gets
+  NOT_FOUND (the client read the head before the sweep); a pin held when the store is
+  closed and opened again loses the retired loose files; a file copy of the store while
+  a pin drops can miss a removed file (`retired/` is skipped, a replaced segment is not
+  named by the catalog the copy reads).
 - [x] **Decision — a move refuses writes (2026-10-28).** Open question 6: from
   export until the source is deleted the network refuses publishes with a retryable
   error carrying a retry delay from the move's expected duration.
@@ -134,13 +177,17 @@ and move them from Outstanding to Done.
 - [ ] **Phase 2b — the bucket transport.** Export to and import from an
   S3-compatible bucket: immutable store files once by name, content once by ID,
   shared by every export to the bucket.
-- [ ] **Phase 4b — pool GC, the collection.** Per network: mark every head's
-  closure, validate each head completely, hold the network's writers
-  ([`Registry::quiesce`], Bart 2026-11-12: the collection is run when the repository
-  is nearly always inactive), rewrite segments keeping only marked records, retire
-  unmarked loose objects and the pool's content records, recover from a crash through
-  `repack.intent`. Runs from `wheat admin gc` (without `--dry-run`) and as a library
-  function Gothab's worker calls per pool.
+- [ ] **Phase 4b — dropping the pool's content (review change 6).** The collection
+  keeps every content record, loose content file and content generation a pool holds.
+  A `NetworkStore` publishes content to the content store, so a network's pool holds
+  content only from before it joined a directory: an adopted standalone repository's
+  copy keeps its records (`adopt_repository`). Dropping them needs the content store
+  checked to hold each record first.
+- [ ] **Question — how long pool GC holds publishes.** Validating every head under the
+  hold is most of it: 335 of 400 s at 10,000 changes plus 20 forks, growing with
+  heads × history. Bart chose validating each head (2026-11-12); whether some of it may
+  run before the hold (validate, then hold and re-read the heads, validating only those
+  that moved) is his call.
 - [ ] **Phase 5 — content GC.** Across the directory: mark every head's
   `required_content` plus delta bases, rebuild the content store keeping only marked
   records.
@@ -411,6 +458,11 @@ lookups in this process. Since GC removes only records no head reaches, a reader
 affected only when it reads an unreachable record (a superseded envelope, question
 4). No further grace period is proposed for the in-process server; an external
 reader of the files (backup by file copy) must not run during a collection.
+
+Superseded (2026-11-12): question 8 chose option A, and Bart chose pinned catalog
+views for it. A sweep no longer closes the replaced segments' readers or removes their
+files when it publishes; it hands them, and the loose objects it retires, to the pins
+taken before it (Phase 4b in Done).
 
 ## Gothab's content (2026-11-06)
 
