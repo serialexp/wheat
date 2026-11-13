@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-11-07
+Last updated: 2026-11-13
 
 ## Implementation status
 
@@ -134,6 +134,15 @@ top of them.
   `ServerStage::submit` with label changes, joined onto the current head as a publish
   from the stage's base is (see [Embedded in Gothab](#embedded-in-gothab)). Tests:
   `server_stage_test.rs`; bench case `server_stage`.
+- [x] **wheat-server as a library without the binary's dependencies (2026-11-13).**
+  A default `standalone` feature, with `tls` and `config-file`; an embedder sets
+  `default-features = false` (see [Embedded in Gothab](#embedded-in-gothab)).
+- [x] **Mirroring a Wheat remote into a served repository (2026-11-13, for Gothab).**
+  Bart chose a call wheat-server owns, with the remote authoritative:
+  `wheat_server::mirror::mirror` (feature `mirror`) makes the head the remote's, as
+  a forced publish naming the current head. The protocol's client side moved from
+  wheat-client into `wheat-remote` so the server can use it. Tests: `mirror_test.rs`;
+  bench case `mirror`.
 
 ### Outstanding
 
@@ -1099,6 +1108,11 @@ caller on in a header of its own, which Gothab's `AccessProvider` reads. The rep
 per namespace. No separate binary — the protocol handler is a library called
 from gothab-server.
 
+Embedded, wheat-server is used with `default-features = false`: the default
+`standalone` feature is the binary's (its command line, allocator, log output, and
+the `tls` and `config-file` features), which a host with its own HTTP stack, logging
+and configuration does not need.
+
 The library does not need to own the socket (`wheat_server::connection`). The
 host checks the upgrade request with `Upgrade::check` (the path names a repository,
 a browser's `Origin` is allowed), upgrades it with its own HTTP stack, and hands
@@ -1219,6 +1233,32 @@ treats `Trimmed` as absent, since a fresh key to a full store looks the same. Th
 `conformance` feature's `heads::conformance::check_head_store` records 1,025 young
 receipts and checks the store keeps them as it declares; Gothab runs it against its
 own store, and Wheat against its table double and the local head.
+
+Gothab mirrors a Wheat remote into a served repository with
+`wheat_server::mirror::mirror(entry, principal, url, token)` (feature `mirror`,
+2026-11-13). Walrus first asked whether gitd should fetch with wheat-client into the
+network's store and move labels with a stage submit. That does not work: a submit's
+tip keeps the base's labels and is unioned onto the head, never replacing it, and
+fetching outside the server skips naming, so content the mirrored head relies on
+that the store held already would never be stamped, and Gothab's content collection
+could reclaim it. Bart chose a call the server owns, with the remote authoritative:
+the head becomes the remote's envelope, labels and all, replacing whatever was
+published to the repository meanwhile.
+
+The mirror takes a writer slot, reads the head, and connects as a client (the
+protocol's client side is the `wheat-remote` crate, which wheat-client uses too). It
+fetches objects and content into a stage over the network's store, incrementally from
+the current head, which the last mirror left at the remote's envelope. What arrived
+is validated as arriving on the current head: only what it adds when the remote's
+history extends the head's, which is the usual case, and whole otherwise (a
+rewritten remote, or the repository published to meanwhile). Then the content the
+new head requires over the current head is named, and the move joins the group commit
+as a forced publish naming the current head, which the commit does not validate again.
+A publish that landed meanwhile makes it `Stale`, and mirroring again replaces it. Its
+publish key is derived from the current head and the remote's envelope, so two
+mirrors of the same move answer the same head. Bench case `mirror`: at 1,000 and
+10,000 changes, mirroring one new change reads 126 and 149 objects of the mirror's
+store. Validating the whole repository each time read 19,455 and 309,612.
 
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new

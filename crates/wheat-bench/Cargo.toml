@@ -24,7 +24,8 @@ gix = { workspace = true }
 wheat-client = { path = "../wheat-client" }
 wheat-core = { path = "../wheat-core" }
 wheat-git = { path = "../wheat-git" }
-wheat-server = { path = "../wheat-server" }
+wheat-remote = { path = "../wheat-remote" }
+wheat-server = { path = "../wheat-server", features = ["mirror"] }
 wheat-store = { path = "../wheat-store" }
 wheat-trace = { path = "../wheat-trace" }
 

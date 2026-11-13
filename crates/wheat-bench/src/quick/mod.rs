@@ -37,6 +37,7 @@ mod large_file;
 mod large_file_git;
 mod latency_proxy;
 mod materialize_wide;
+mod mirror;
 mod network_export;
 mod network_import;
 mod network_publish;
@@ -116,6 +117,7 @@ pub const CASES: &[&str] = &[
     structure_gc::NAME,
     state_scan::NAME,
     server_stage::NAME,
+    mirror::NAME,
     status_scale::NAME,
     label_move::NAME,
     label_frontiers::NAME,
@@ -292,6 +294,7 @@ pub fn run_case(
         structure_gc::NAME => structure_gc::run(&context),
         state_scan::NAME => state_scan::run(&context),
         server_stage::NAME => server_stage::run(&context),
+        mirror::NAME => mirror::run(&context),
         status_scale::NAME => status_scale::run(&context),
         label_move::NAME => label_move::run(&context),
         label_frontiers::NAME => label_frontiers::run(&context),

@@ -49,8 +49,8 @@ const STAGED_BYTES: usize = 16 * 1024 * 1024;
 
 /// The most objects, and bytes, a [`ServerStage`] holds before storing them early:
 /// as many as a publish's stage.
-const STAGE_OBJECTS: usize = 65_536;
-const STAGE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const STAGE_OBJECTS: usize = 65_536;
+pub(crate) const STAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// One label a write changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +116,7 @@ pub async fn write(
 }
 
 /// A slot among the repository's writers, or why there is none.
-fn begin(entry: &RepositoryEntry) -> Result<Writing, WriteFailure> {
+pub(crate) fn begin(entry: &RepositoryEntry) -> Result<Writing, WriteFailure> {
     entry
         .network
         .writers
@@ -445,24 +445,38 @@ async fn built(
     if !naming {
         return Ok(BuiltState { needed: Vec::new() });
     }
+    let needed = needed_over(&inner.stage, before.state, after.state)
+        .await
+        .map_err(|e| WriteFailure::Commit(CommitFailure::Internal(format!("server stage: {e}"))))?;
+    Ok(BuiltState { needed })
+}
+
+/// The content a head moving from the state `before` to `after` relies on that
+/// `before` did not: what `after` requires over `before`, with everything reading it
+/// needs. What a network that is told what publishes rely on is told before such a
+/// move joins the commit.
+pub(crate) async fn needed_over(
+    stage: &RepositoryStage<Network>,
+    before: wheat_core::RepositoryStateId,
+    after: wheat_core::RepositoryStateId,
+) -> Result<Vec<wheat_core::ContentId>, String> {
+    let reader = RepositoryReader::new(stage, stage.content());
     let reader = &reader;
     let required = |state| async move {
         reader
             .state(state)
             .await
             .map(|state| state.required_content)
-            .map_err(|e| internal("read a state", &e))
+            .map_err(|e| format!("read a state: {}", chain(&e)))
     };
-    let added = wheat_store::ContentSetStore::new(inner.stage.as_ref())
-        .added(required(before.state).await?, required(after.state).await?)
+    let added = wheat_store::ContentSetStore::new(stage)
+        .added(required(before).await?, required(after).await?)
         .await
-        .map_err(|e| internal("compare the content sets", &e))?;
-    let needed = inner
-        .stage
+        .map_err(|e| format!("compare the content sets: {}", chain(&e)))?;
+    stage
         .content()
         .needed_to_read(added, [])
-        .map_err(|e| internal("find what the built content needs", &e))?;
-    Ok(BuiltState { needed })
+        .map_err(|e| format!("find what the content needs: {}", chain(&e)))
 }
 
 /// What [`published`] found of a stage submit.

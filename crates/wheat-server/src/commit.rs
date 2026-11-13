@@ -203,6 +203,52 @@ pub async fn accept<S: RepositoryStore + 'static>(
     announcement: Option<Announcement>,
     named: Option<Named>,
 ) -> Result<Accepted, CommitFailure> {
+    let check = |durable, current| Check {
+        durable,
+        current,
+        expected,
+        proposed,
+        force,
+        force_labels,
+        validated: false,
+    };
+    accept_checked(entry, staged, key, check, announcement, named).await
+}
+
+/// [`accept`] for a forced publish of `proposed` onto `expected` that the caller
+/// validated already, as arriving on `expected`, in `staged`: a mirror, which can
+/// validate incrementally when the remote's history extends the head. A forced
+/// publish is accepted only onto exactly the head it names, so the validation holds.
+#[cfg(feature = "mirror")]
+pub(crate) async fn accept_validated_forced<S: RepositoryStore + 'static>(
+    entry: &Arc<RepositoryEntry>,
+    staged: &Arc<RepositoryStage<S>>,
+    key: PublishKey,
+    expected: RepositoryEnvelopeId,
+    proposed: RepositoryEnvelopeId,
+    named: Option<Named>,
+) -> Result<Accepted, CommitFailure> {
+    let check = |durable, current| Check {
+        durable,
+        current,
+        expected,
+        proposed,
+        force: true,
+        force_labels: true,
+        validated: true,
+    };
+    accept_checked(entry, staged, key, check, None, named).await
+}
+
+/// Accepts the publish `check` makes of the durable head and the current one.
+async fn accept_checked<S: RepositoryStore + 'static>(
+    entry: &Arc<RepositoryEntry>,
+    staged: &Arc<RepositoryStage<S>>,
+    key: PublishKey,
+    check: impl FnOnce(RepositoryHead, RepositoryEnvelopeId) -> Check,
+    announcement: Option<Announcement>,
+    named: Option<Named>,
+) -> Result<Accepted, CommitFailure> {
     let mut turn = entry
         .commit
         .state
@@ -216,14 +262,8 @@ pub async fn accept<S: RepositoryStore + 'static>(
     let current = turn.tentative.unwrap_or(durable.envelope);
     let pending = turn.pending();
     let stage = Arc::clone(staged);
-    let check = Check {
-        durable,
-        current,
-        expected,
-        proposed,
-        force,
-        force_labels,
-    };
+    let check = check(durable, current);
+    let force = check.force;
     // Joining and validating read the store, so they run on a blocking thread.
     let joined = crate::blocking::drive(move || async move { check.join(&pending, &stage).await })
         .await
@@ -408,6 +448,7 @@ async fn build_labels<S: RepositoryStore>(
         proposed: proposed.id(),
         force: false,
         force_labels,
+        validated: false,
     };
     Ok(check.join(pending, staged).await?)
 }
@@ -420,6 +461,9 @@ struct Check {
     proposed: RepositoryEnvelopeId,
     force: bool,
     force_labels: bool,
+    /// The caller validated `proposed` as arriving on `expected`, for a forced
+    /// publish, which joins only onto exactly `expected`.
+    validated: bool,
 }
 
 impl Check {
@@ -447,15 +491,17 @@ impl Check {
                 .await
                 .map_err(|e| join_failure(e, durable))?
         };
-        match validate(&reader, self.current, joined, self.force).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                return Err(CommitFailure::Rejected {
-                    head: durable,
-                    message: format!("validation failed: {e}"),
-                });
+        if !(self.validated && self.force) {
+            match validate(&reader, self.current, joined, self.force).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(CommitFailure::Rejected {
+                        head: durable,
+                        message: format!("validation failed: {e}"),
+                    });
+                }
+                Err(e) => return Err(CommitFailure::Internal(e)),
             }
-            Err(e) => return Err(CommitFailure::Internal(e)),
         }
         if !self.force_labels {
             refuse_backward_labels(&reader, self.current, joined, durable).await?;

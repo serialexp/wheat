@@ -13,6 +13,8 @@ conformance = []
 tls = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls"]
 # Reading the standalone server's TOML config file (`config::FileConfig::parse`).
 config-file = ["dep:toml"]
+# `mirror`: making a served repository's head a Wheat remote's, fetched as a client.
+mirror = ["dep:anyhow", "dep:wheat-remote"]
 # The `wheat-server` binary: everything above, plus its command line, allocator and
 # log output. An embedder using the crate as a library sets `default-features = false`.
 standalone = [
@@ -31,6 +33,7 @@ path = "src/main.rs"
 required-features = ["standalone"]
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 async-trait = "0.1"
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -49,6 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 uuid = { workspace = true }
 wheat-core = { path = "../wheat-core" }
 wheat-protocol = { path = "../wheat-protocol" }
+wheat-remote = { path = "../wheat-remote", optional = true }
 wheat-store = { path = "../wheat-store" }
 wheat-trace = { path = "../wheat-trace", optional = true }
 
@@ -58,8 +62,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
+wheat-remote = { path = "../wheat-remote" }
 # The integration tests run the conformance check against Wheat's own head stores.
-wheat-server = { path = ".", features = ["conformance", "standalone"] }
+wheat-server = { path = ".", features = ["conformance", "mirror", "standalone"] }
 
 [lints]
 workspace = true

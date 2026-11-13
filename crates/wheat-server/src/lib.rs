@@ -24,6 +24,8 @@ mod error_text;
 pub mod fetch;
 pub mod heads;
 pub mod hooks;
+#[cfg(feature = "mirror")]
+pub mod mirror;
 pub mod naming;
 pub mod network;
 pub mod publish;
