@@ -49,7 +49,7 @@ impl Network {
     /// (see [`wheat_store::collect_structure`]). `heads` is the head of every
     /// repository of the network, named or not, read while `held` holds it.
     ///
-    /// `held` is a hold on a repository of this network ([`Registry::quiesce`] or
+    /// `held` is a hold on a repository of this network ([`Registry::quiesce`](crate::registry::Registry::quiesce) or
     /// [`Quiesced::hold`]), kept from before the heads were read: a publish's objects
     /// are stored before a head names them, so one let in meanwhile could lose them.
     /// Fetches go on, reading the store as it was when they began. Runs on a thread for
