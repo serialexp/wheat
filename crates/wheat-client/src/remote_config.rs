@@ -17,7 +17,7 @@ use wheat_core::{
 };
 use wheat_store::RepositoryHead;
 
-use crate::remote::{WheatUrl, parse_wheat_url};
+use wheat_remote::{WheatUrl, parse_wheat_url};
 
 /// The remote binding, in a store's root.
 pub const REMOTE_CONFIG_FILE: &str = "remote.meta";

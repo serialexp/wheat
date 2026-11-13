@@ -152,7 +152,7 @@ and move them from Outstanding to Done.
   (`AdminStart`, `AdminStarted`, `AdminStatusRequest`, `AdminStatus`; types 0x50–0x53;
   `wheat-protocol.bs.json5`), an `admin = true` flag on a principal in `[auth]`
   (`AccessProvider::is_admin`), the operation runner (`wheat-server/src/admin.rs`)
-  and `wheat admin --server <url> export | import | adopt` (`wheat-client/src/remote_admin.rs`).
+  and `wheat admin --server <url> export | import | adopt` (`wheat-remote/src/admin.rs`).
   Built early so the operations can be driven through the real interface while their
   shape may still change; GC has no message yet. Tests: `remote_admin.rs`
   in `wheat-cli` (export on one server, import on another, adoption, confinement,

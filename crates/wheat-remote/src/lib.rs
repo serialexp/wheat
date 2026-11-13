@@ -3,7 +3,11 @@
 //! Connects to a wheat-server over WebSocket, performs session handshake,
 //! and implements the client half of fetch (the server pushes what the client's
 //! last fetch lacks, the client pulls any gaps) and publish (object/content
-//! upload, commit).
+//! upload, commit). [`admin`] runs maintenance operations over the admin path.
+//!
+//! The Wheat client uses it, and so does wheat-server to mirror a remote.
+
+pub mod admin;
 
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};

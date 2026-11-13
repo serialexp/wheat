@@ -6142,6 +6142,7 @@ dependencies = [
  "wheat-git",
  "wheat-ignore",
  "wheat-protocol",
+ "wheat-remote",
  "wheat-server",
  "wheat-store",
  "wheat-trace",
@@ -6156,26 +6157,22 @@ dependencies = [
  "blake3",
  "chrono",
  "crc32fast",
- "futures",
  "globset",
  "libc",
  "rusqlite",
- "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "similar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-tungstenite",
  "tracing",
- "url",
  "uuid",
  "wheat-core",
  "wheat-git",
  "wheat-ignore",
  "wheat-protocol",
+ "wheat-remote",
  "wheat-store",
 ]
 
@@ -6261,9 +6258,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wheat-remote"
+version = "0.3.6"
+dependencies = [
+ "anyhow",
+ "futures",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "uuid",
+ "wheat-core",
+ "wheat-protocol",
+ "wheat-store",
+]
+
+[[package]]
 name = "wheat-server"
 version = "0.3.6"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "bytes",
@@ -6284,6 +6301,7 @@ dependencies = [
  "uuid",
  "wheat-core",
  "wheat-protocol",
+ "wheat-remote",
  "wheat-server",
  "wheat-store",
  "wheat-trace",

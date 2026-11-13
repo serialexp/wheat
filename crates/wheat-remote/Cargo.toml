@@ -1,0 +1,27 @@
+[package]
+name = "wheat-remote"
+version.workspace = true
+edition = "2024"
+autotests = false
+
+# The client half of the Wheat protocol: connecting to a wheat-server, fetching from
+# it, publishing to it and its admin operations. Shared by wheat-client and by
+# wheat-server's mirroring, so neither needs the other.
+
+[dependencies]
+anyhow = { workspace = true }
+futures = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-native-roots"] }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+wheat-core = { path = "../wheat-core" }
+wheat-protocol = { path = "../wheat-protocol" }
+wheat-store = { path = "../wheat-store" }
+
+[lints]
+workspace = true

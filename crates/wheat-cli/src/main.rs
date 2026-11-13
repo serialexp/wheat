@@ -43,11 +43,12 @@ use wheat_client::{
     active_changes, authoring, authoring_metadata, blame_inspection, conflict_inspection,
     credential, diff_render, discovery, dot_git, edit_move, frontier_service, git_pull,
     hidden_labels, ignore_import, import_trace, inspection, label_move, label_service, local,
-    log_inspection, materialization, prompt, remote, remote_config, repack, rewrite_transaction,
+    log_inspection, materialization, prompt, remote_config, repack, rewrite_transaction,
     selection_recovery, squash, squash_attribution, store_analyze, store_lookup, workspace,
     workspace_clone, workspace_diff, workspace_lifecycle, workspace_metadata,
     workspace_registry_service, workspace_scan, workspace_status,
 };
+use wheat_remote as remote;
 use workspace_lifecycle::{ensure_fresh_workspace, initialize_workspace_directory};
 use workspace_metadata::{PendingRepositoryOperation, StoreMetadata, WorkspaceMetadata};
 use workspace_scan::ensure_workspace_clean_locked;
@@ -917,7 +918,7 @@ fn main() -> ExitCode {
 
 /// Runs an admin operation on a server and waits for it to end.
 fn admin(arguments: AdminArgs) -> Result<Success> {
-    use wheat_client::remote_admin::{self, Finished, Operation, Refused};
+    use wheat_remote::admin::{self as remote_admin, Finished, Operation, Refused};
 
     let command = match &arguments.action {
         AdminAction::Export { .. } => "admin.export",

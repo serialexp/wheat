@@ -22,6 +22,7 @@ wheat-client = { path = "../wheat-client" }
 wheat-core = { path = "../wheat-core" }
 wheat-ignore = { path = "../wheat-ignore" }
 wheat-git = { path = "../wheat-git" }
+wheat-remote = { path = "../wheat-remote" }
 wheat-store = { path = "../wheat-store" }
 wheat-trace = { path = "../wheat-trace" }
 

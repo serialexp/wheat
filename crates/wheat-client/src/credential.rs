@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::authoring_metadata::{self, UserConfig};
-use crate::remote::WheatUrl;
+use wheat_remote::WheatUrl;
 
 /// Largest token Wheat will send; the server looks at no more than this.
 const MAX_TOKEN_BYTES: usize = 8 * 1024;
@@ -140,7 +140,7 @@ fn parse_token(output: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::parse_wheat_url;
+    use wheat_remote::parse_wheat_url;
 
     fn url() -> WheatUrl {
         parse_wheat_url("wheat://Example.com:7420/team/repo").unwrap()

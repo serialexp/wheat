@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use crate::{remote::WheatUrl, remote_config::RemoteConfig, workspace_metadata::StoreMetadata};
+use wheat_remote::WheatUrl;
+
+use crate::{remote_config::RemoteConfig, workspace_metadata::StoreMetadata};
 
 const MAX_STORE_CANDIDATES: usize = 10_000;
 

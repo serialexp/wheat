@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 use wheat_protocol::*;
 
-use crate::remote::WheatSession;
+use crate::WheatSession;
 
 /// How long [`wait`] leaves between asking how an operation is doing.
 const POLL: Duration = Duration::from_millis(200);
