@@ -188,6 +188,13 @@ Finished items, moved here from `TODO.md` under the same headings.
   path `/{owner/repo}`, no name in the protocol, header only, provider sees the
   request). Tests: `protocol_test.rs`, `access_test.rs`
   (`a_provider_can_trust_its_front_door_for_who_is_calling`).
+- `[x]` **wheat-server as a library without its binary's dependencies (2026-11-13).**
+  The binary's command line, allocator, log output, TLS and config file are behind
+  the default `standalone` feature (with `tls` and `config-file` on their own), so
+  gitd embeds wheat-server with `default-features = false` and leaves out clap,
+  mimalloc, toml, tracing-subscriber, rustls and wheat-trace. CI and `just clippy`
+  lint that build, since the workspace build always has the default features on
+  (f76003e).
 
 ## Desktop client (2026-10-22)
 
