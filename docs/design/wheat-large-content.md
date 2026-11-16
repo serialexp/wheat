@@ -2,7 +2,7 @@
 
 Status: partial — steps 1–7 and the stat cache with sampled status landed; recording the cache on materialize and add outstanding
 Owner: bart
-Last updated: 2026-11-06
+Last updated: 2026-11-16
 
 ## Implementation status
 
@@ -191,11 +191,21 @@ land and move them from Outstanding to Done.
   limited only by the format's 1 TiB. `status_scale` now has a 1.25 GiB file at full
   scale: the first status reads 1.43 GB in 0.80 s, hashing the long file in full
   takes 0.37 s, and the case peaks at 101 MiB (budget 192 MiB).
+- [x] **Snapshots (2026-11-16).** Was deferred: export sent content whole and refused
+  a blob over its 8 MiB batch. Gothab's archive snapshots need it. A snapshot
+  manifest (now `SnapshotManifestV2`) lists a blob over the threshold under
+  `chunked`, with the length of its encoded chunk manifest, which is all the
+  snapshot carries for it (`SnapshotSink::write_chunked`,
+  `SnapshotSource::read_chunked`); its parts and chunks are ordinary content items.
+  Restore stores the parts and chunks first, then each blob's manifest once
+  `check_manifest` finds the chunks hold its bytes. Whole content up to 16 MiB now
+  fits too: an item larger than a batch travels alone. Tests in
+  `wheat-store/tests/snapshot_restore.rs` and `wheat-server/tests/restore_test.rs`.
+  Parts are walked by the same `ManifestChunks` as the store, but no test builds
+  a blob long enough to have parts (several GiB).
 
 ### Outstanding
 
-- [ ] **Defer — snapshot export.** `export_snapshot_to`, used by tests and a bench case
-  only, sends content whole and refuses a blob over its 8 MiB batch.
 - [ ] **Defer — the in-memory Git importer.** `wheat_git::import_repository`, used by
   tests and an example only, still reads every blob whole and refuses one over the
   guarded bound.

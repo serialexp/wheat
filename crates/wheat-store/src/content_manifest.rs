@@ -182,7 +182,57 @@ impl ManifestChunks {
     }
 }
 
+/// What [`ContentStore::whole_or_manifest`] read.
+#[derive(Debug)]
+pub(crate) enum StoredBlob {
+    /// The blob's bytes, stored whole.
+    Whole(Vec<u8>),
+    /// The blob's chunk manifest: it is stored as chunks.
+    Chunked(ContentChunkManifestRecord),
+}
+
 impl ContentStore {
+    /// `id`'s bytes, at most `max` of them, when it is stored whole, or its chunk
+    /// manifest when it is stored as chunks, from one read of its record.
+    pub(crate) fn whole_or_manifest(
+        &self,
+        id: ContentId,
+        max: usize,
+    ) -> Result<StoredBlob, ContentStoreError> {
+        let stored = self.stored(id)?;
+        if let crate::content_store::StoredContent::Envelope(header, _) = &stored
+            && header.codec == crate::codec::Codec::Chunked
+        {
+            let crate::content_store::StoredContent::Envelope(header, payload) = stored else {
+                unreachable!("matched above");
+            };
+            return crate::content_stream::chunk_manifest(id, header, payload)
+                .map(StoredBlob::Chunked);
+        }
+        let first = std::cell::Cell::new(Some(stored));
+        crate::content_store::resolve_delta_chain(id, max, |current| {
+            first.take().map_or_else(|| self.stored(current), Ok)
+        })
+        .map(|content| StoredBlob::Whole(content.into_inner()))
+    }
+
+    /// Stores the chunked blob `id` as `manifest`, once [`Self::check_manifest`]
+    /// finds the chunks it names, all stored here already, hold its bytes. Does
+    /// nothing when `id` is stored.
+    pub(crate) fn put_checked_manifest(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), ContentStoreError> {
+        if self.contains(id) {
+            return Ok(());
+        }
+        self.check_manifest(id, manifest)?;
+        let envelope = crate::codec::encode_chunked_envelope(manifest)
+            .map_err(|error| crate::content_store::codec_error(id, usize::MAX, error))?;
+        self.put_raw_envelope(id, envelope)
+    }
+
     /// The manifest of `id` when it is stored as chunks; `None` for a blob stored
     /// whole.
     pub fn chunk_manifest(

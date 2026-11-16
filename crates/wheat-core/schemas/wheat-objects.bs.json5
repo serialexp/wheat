@@ -1167,15 +1167,19 @@
       ],
     },
     // A native repository snapshot's manifest; its BLAKE3 digest is the snapshot ID.
-    SnapshotManifestV1: {
+    // `contents` are stored whole (chunks and parts of long blobs among them);
+    // `chunked` are the long blobs, each with the length of its encoded chunk
+    // manifest (ContentChunkManifestV1), which is what the snapshot carries for it.
+    SnapshotManifestV2: {
       sequence: [
         { name: "magic", type: "uint32", const: 0x5748534e },
-        { name: "version", type: "uint16", const: 1 },
+        { name: "version", type: "uint16", const: 2 },
         { name: "head_generation", type: "uint64" },
         { name: "head_envelope", type: "Digest256" },
         { name: "envelope", type: "Digest256" },
         { name: "objects", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
         { name: "contents", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
+        { name: "chunked", type: "array", kind: "length_prefixed", length_type: "uint32", items: { type: "InventoryEntryV1" } },
       ],
     },
     // What one owner (1 = repository, 2 = snapshot) keeps alive; its BLAKE3

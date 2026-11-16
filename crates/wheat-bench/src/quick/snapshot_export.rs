@@ -7,21 +7,32 @@
 //! item must not grow with the repository: the case builds one repository with four
 //! times the files of another and compares.
 //!
+//! Last, the large repository is exported again into a sink that holds every
+//! content of the first export, as an archive taking a snapshot a day does, with the
+//! source's content deleted first: that export must read and write no content.
+//!
 //! Both have the same number of changes. Every view keeps a list of all its files
 //! (its content set), so growing files and changes together would grow the bytes with
 //! their product, much faster than the item count. With the changes fixed, items and
 //! bytes grow alike.
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 
 use anyhow::{Result, ensure};
+use async_trait::async_trait;
 use wheat_core::{
-    ChangeId, ChangeMetadata, ChangeProposal, ContentId, FileKind, FileValue, Repository,
+    ChangeId, ChangeMetadata, ChangeProposal, ContentId, FileKind, FileValue, ObjectId, Repository,
     RevisionMetadata, Tree,
 };
 use wheat_store::{
-    NativeSnapshot, PublicationStore, RepositoryPublisher, RepositoryReader, SnapshotLimits,
-    export_snapshot, restore_snapshot,
+    MemorySnapshotSink, NativeSnapshot, PublicationStore, RepositoryPublisher, RepositoryReader,
+    SnapshotError, SnapshotId, SnapshotLimits, SnapshotSink, export_snapshot, export_snapshot_to,
+    restore_snapshot,
 };
 
 use super::{
@@ -39,6 +50,8 @@ const GROWTH: usize = 4;
 const FILES_PER_DIRECTORY: usize = 25;
 /// Export and restore each run this many times; the median counts.
 const SAMPLES: usize = 3;
+/// Content an export into a sink that holds it all may read or write: none.
+const HELD_CONTENT_WRITTEN: f64 = 0.0;
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let files = context.scale.pick(10_000, 100);
@@ -66,6 +79,7 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
         "large",
         &mut recorder,
     ))?;
+    recorder.at_most("large.held_contents_written", HELD_CONTENT_WRITTEN, "count");
     for (step, small, large) in [
         ("export", small.export, large.export),
         ("restore", small.restore, large.restore),
@@ -98,7 +112,7 @@ async fn measure_size(
     build(&scratch, files, changes).await?;
     recorder.wall(&format!("{step}.build"), started.elapsed().as_secs_f64());
 
-    // Export and restore both end with this check; timed alone to tell it apart.
+    // Restore ends with this check; timed alone to tell it apart.
     let started = Instant::now();
     RepositoryReader::new(&scratch.objects, &scratch.content)
         .validate_envelope(scratch.heads.read()?.envelope)
@@ -166,6 +180,39 @@ async fn measure_size(
     let restore = measure::median(walls);
     recorder.wall(&format!("{step}.restore"), restore);
 
+    // Again, into a sink holding every content, with the source's content gone:
+    // reading any would fail.
+    let sink = HoldingSink {
+        held: snapshot
+            .manifest
+            .contents
+            .iter()
+            .map(|entry| (entry.id, entry.bytes))
+            .collect(),
+        memory: MemorySnapshotSink::default(),
+        written: AtomicUsize::new(0),
+    };
+    std::fs::remove_dir_all(root.join("source").join("content"))?;
+    let started = Instant::now();
+    let id = export_snapshot_to(
+        &scratch.objects,
+        &scratch.content,
+        &scratch.heads,
+        &sink,
+        limits,
+    )
+    .await?;
+    recorder.wall(
+        &format!("{step}.held_export"),
+        started.elapsed().as_secs_f64(),
+    );
+    ensure!(id == snapshot.manifest_id, "the held export differs");
+    recorder.value(
+        &format!("{step}.held_contents_written"),
+        sink.written.load(Ordering::Relaxed) as f64,
+        "count",
+    );
+
     recorder.value(
         &format!("{step}.export_per_item"),
         export / items * 1e3,
@@ -180,6 +227,39 @@ async fn measure_size(
         export: export / items,
         restore: restore / items,
     })
+}
+
+/// A sink that holds the content of an earlier export, and counts the content it
+/// is given anyway.
+struct HoldingSink {
+    held: HashMap<ContentId, u64>,
+    memory: MemorySnapshotSink,
+    written: AtomicUsize,
+}
+
+#[async_trait]
+impl SnapshotSink for HoldingSink {
+    async fn write_objects(&self, objects: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        self.memory.write_objects(objects).await
+    }
+
+    async fn write_contents(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        self.written.fetch_add(contents.len(), Ordering::Relaxed);
+        self.memory.write_contents(contents).await
+    }
+
+    async fn write_chunked(&self, manifests: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        self.written.fetch_add(manifests.len(), Ordering::Relaxed);
+        self.memory.write_chunked(manifests).await
+    }
+
+    async fn held_contents(&self, ids: &[ContentId]) -> Result<Vec<Option<u64>>, SnapshotError> {
+        Ok(ids.iter().map(|id| self.held.get(id).copied()).collect())
+    }
+
+    async fn commit_manifest(&self, id: SnapshotId, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.memory.commit_manifest(id, bytes).await
+    }
 }
 
 fn value(index: usize) -> Vec<u8> {

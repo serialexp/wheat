@@ -133,23 +133,29 @@ fn content_envelope_header_round_trips_and_leaves_the_codec_to_the_caller() {
 fn snapshot_manifest_round_trips_and_bounds_its_counts_before_decoding() {
     let objects = inventory(&[1, 2, 3]);
     let contents = inventory(&[4, 5]);
-    let encode = |objects: &[InventoryRecord], contents: &[InventoryRecord]| {
-        encode_snapshot_manifest(
-            7,
-            [8; 32],
-            [9; 32],
-            objects.iter().copied(),
-            contents.iter().copied(),
-        )
-        .unwrap()
-    };
-    let bytes = encode(&objects, &contents);
+    let chunked = inventory(&[6]);
+    let encode =
+        |objects: &[InventoryRecord], contents: &[InventoryRecord], chunked: &[InventoryRecord]| {
+            encode_snapshot_manifest(
+                7,
+                [8; 32],
+                [9; 32],
+                objects.iter().copied(),
+                contents.iter().copied(),
+                chunked.iter().copied(),
+            )
+            .unwrap()
+        };
+    let bytes = encode(&objects, &contents, &chunked);
     assert_eq!(
         bytes.len(),
-        SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE + 5 * INVENTORY_ENTRY_ENCODED_SIZE
+        SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE + 6 * INVENTORY_ENTRY_ENCODED_SIZE
     );
-    assert_eq!(encode(&[], &[]).len(), SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE);
-    let decoded = decode_snapshot_manifest(&bytes, 3, 2).unwrap();
+    assert_eq!(
+        encode(&[], &[], &[]).len(),
+        SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE
+    );
+    let decoded = decode_snapshot_manifest(&bytes, 3, 3).unwrap();
     assert_eq!(
         decoded,
         SnapshotManifestRecord {
@@ -158,19 +164,21 @@ fn snapshot_manifest_round_trips_and_bounds_its_counts_before_decoding() {
             envelope: [9; 32],
             objects,
             contents,
+            chunked,
         }
     );
-    // Either inventory over its limit is refused.
+    // Either inventory over its limit is refused; whole and chunked content count
+    // together.
     assert_eq!(
-        decode_snapshot_manifest(&bytes, 2, 2),
+        decode_snapshot_manifest(&bytes, 2, 3),
         Err(StoreRecordError::InvalidCount)
     );
     assert_eq!(
-        decode_snapshot_manifest(&bytes, 3, 1),
+        decode_snapshot_manifest(&bytes, 3, 2),
         Err(StoreRecordError::InvalidCount)
     );
     // A forged count larger than the bytes can hold runs out of input.
-    let mut forged = encode(&[], &[]);
+    let mut forged = encode(&[], &[], &[]);
     forged[78..82].copy_from_slice(&[0xff; 4]);
     assert!(matches!(
         decode_snapshot_manifest(&forged, usize::MAX, usize::MAX),
@@ -178,8 +186,8 @@ fn snapshot_manifest_round_trips_and_bounds_its_counts_before_decoding() {
     ));
     let mut trailing = bytes.clone();
     trailing.push(0);
-    assert!(decode_snapshot_manifest(&trailing, 3, 2).is_err());
-    assert!(decode_snapshot_manifest(&bytes[..bytes.len() - 1], 3, 2).is_err());
+    assert!(decode_snapshot_manifest(&trailing, 3, 3).is_err());
+    assert!(decode_snapshot_manifest(&bytes[..bytes.len() - 1], 3, 3).is_err());
 }
 
 #[test]
@@ -292,8 +300,15 @@ fn store_records_are_not_interchangeable() {
         0,
     )
     .unwrap();
-    let snapshot =
-        encode_snapshot_manifest(1, [1; 32], [1; 32], [].into_iter(), [].into_iter()).unwrap();
+    let snapshot = encode_snapshot_manifest(
+        1,
+        [1; 32],
+        [1; 32],
+        [].into_iter(),
+        [].into_iter(),
+        [].into_iter(),
+    )
+    .unwrap();
     let ownership = encode_ownership_manifest(1, [1; 32], [].into_iter(), [].into_iter()).unwrap();
     let source = encode_git_import_source(b"", b"", [].into_iter()).unwrap();
     let magics: Vec<&[u8]> = [&head, &envelope, &progress, &snapshot, &ownership, &source]

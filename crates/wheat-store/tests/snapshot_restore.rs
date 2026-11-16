@@ -59,13 +59,46 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let root = tempfile::tempdir().unwrap();
-    let (objects, content, heads) = stores(root.path());
-    let payloads = vec![
+    fixture_of(vec![
         b"shared source payload".to_vec(),
         vec![b'x'; 257],
         vec![b'y'; 513],
-    ];
+    ])
+    .await
+}
+
+/// Bytes no chunk boundary repeats in: a blob of them is cut into distinct chunks.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut bytes = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
+}
+
+/// A repository whose third file is a blob over the chunking threshold.
+async fn large_fixture() -> Fixture {
+    let large = noise(
+        wheat_core::CHUNKED_CONTENT_THRESHOLD as usize + (3 << 20),
+        7,
+    );
+    fixture_of(vec![
+        b"shared source payload".to_vec(),
+        vec![b'x'; 257],
+        large,
+    ])
+    .await
+}
+
+/// A repository of three files holding `payloads`.
+async fn fixture_of(payloads: Vec<Vec<u8>>) -> Fixture {
+    let root = tempfile::tempdir().unwrap();
+    let (objects, content, heads) = stores(root.path());
     for payload in &payloads {
         content.put(payload).unwrap();
     }
@@ -359,6 +392,8 @@ struct RecordingSink {
     fail_payload_call: AtomicUsize,
     payload_calls: AtomicUsize,
     manifest_calls: AtomicUsize,
+    /// What [`SnapshotSink::held_contents`] answers: content an earlier snapshot holds.
+    held: Mutex<std::collections::HashMap<ContentId, u64>>,
 }
 
 impl RecordingSink {
@@ -391,6 +426,20 @@ impl SnapshotSink for RecordingSink {
             batch.iter().map(|item| item.1.len()).sum(),
         )?;
         self.memory.write_contents(batch).await
+    }
+
+    async fn write_chunked(&self, batch: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        self.record(
+            'k',
+            batch.len(),
+            batch.iter().map(|item| item.1.len()).sum(),
+        )?;
+        self.memory.write_chunked(batch).await
+    }
+
+    async fn held_contents(&self, ids: &[ContentId]) -> Result<Vec<Option<u64>>, SnapshotError> {
+        let held = self.held.lock().unwrap();
+        Ok(ids.iter().map(|id| held.get(id).copied()).collect())
     }
 
     async fn commit_manifest(&self, id: SnapshotId, bytes: &[u8]) -> Result<(), SnapshotError> {
@@ -550,6 +599,17 @@ impl SnapshotSource for CheckedSource {
         )?;
         self.snapshot.read_contents(inventory).await
     }
+
+    async fn read_chunked(
+        &self,
+        inventory: &[InventoryEntry<ContentId>],
+    ) -> Result<ContentBatch, SnapshotError> {
+        self.check(
+            inventory.iter().map(|item| item.bytes as usize).sum(),
+            inventory.len(),
+        )?;
+        self.snapshot.read_chunked(inventory).await
+    }
 }
 
 impl CheckedSource {
@@ -598,6 +658,227 @@ async fn streaming_restore_bounds_batches_and_retries_after_middle_source_failur
         .await
         .unwrap();
     assert!(source.saw_exact_item_limit.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_blob_over_the_threshold_travels_as_its_manifest_and_restores_whole() {
+    let fixture = large_fixture().await;
+    let large = ContentId::of(&fixture.payloads[2]);
+    assert!(fixture.content.chunk_manifest(large).unwrap().is_some());
+    let snapshot = export_snapshot(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .manifest
+            .chunked
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [large]
+    );
+    assert!(
+        !snapshot
+            .manifest
+            .contents
+            .iter()
+            .any(|entry| entry.id == large)
+    );
+    // The two small files and the large one's chunks, each no longer than a chunk.
+    assert!(snapshot.manifest.contents.len() > 3);
+    assert!(
+        snapshot
+            .manifest
+            .contents
+            .iter()
+            .all(|entry| { entry.bytes <= u64::from(wheat_core::MAX_CONTENT_CHUNK_BYTES) })
+    );
+    assert_eq!(
+        SnapshotManifest::decode(
+            &snapshot.manifest.canonical_bytes(),
+            SnapshotLimits::default()
+        )
+        .unwrap(),
+        snapshot.manifest
+    );
+    let ownership = snapshot.manifest.snapshot_ownership();
+    assert!(ownership.contents.iter().any(|entry| entry.id == large));
+    assert!(ownership.contents.is_sorted_by_key(|entry| entry.id));
+
+    let destination = tempfile::tempdir().unwrap();
+    let (objects, content, heads) = stores(destination.path());
+    let restored = restore_snapshot(
+        &snapshot,
+        &objects,
+        &content,
+        &heads,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored, snapshot.manifest.head);
+    content.verify(large).unwrap();
+    assert_eq!(
+        content
+            .get_bounded(large, fixture.payloads[2].len())
+            .unwrap(),
+        fixture.payloads[2]
+    );
+}
+
+#[tokio::test]
+async fn a_chunked_blob_whose_manifest_lies_is_refused() {
+    let fixture = large_fixture().await;
+    let mut snapshot = export_snapshot(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    // The manifest of another blob, the same length, under the large blob's ID.
+    let other = noise(fixture.payloads[2].len(), 11);
+    let scratch = tempfile::tempdir().unwrap();
+    let (_, scratch_content, _) = stores(scratch.path());
+    let other_id = scratch_content.put(&other).unwrap();
+    let manifest = scratch_content.chunk_manifest(other_id).unwrap().unwrap();
+    let bytes = wheat_core::encode_content_chunk_manifest(&manifest).unwrap();
+    snapshot.manifest.chunked[0].bytes = bytes.len() as u64;
+    snapshot.chunked[0].1 = bytes;
+    snapshot.manifest_id = snapshot.manifest.id();
+
+    let destination = tempfile::tempdir().unwrap();
+    let (objects, content, heads) = stores(destination.path());
+    assert!(
+        restore_snapshot(
+            &snapshot,
+            &objects,
+            &content,
+            &heads,
+            SnapshotLimits::default()
+        )
+        .await
+        .is_err()
+    );
+    assert!(heads.read().is_err());
+}
+
+#[tokio::test]
+async fn an_item_over_the_batch_bytes_travels_alone() {
+    let fixture = fixture().await;
+    // The 513-byte file is larger than a batch may otherwise hold.
+    let limits = SnapshotLimits {
+        batch_bytes: 300,
+        ..SnapshotLimits::default()
+    };
+    let sink = RecordingSink::default();
+    export_snapshot_to(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        &sink,
+        limits,
+    )
+    .await
+    .unwrap();
+    {
+        let calls = sink.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, _, bytes)| *bytes > limits.batch_bytes)
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|(_, _, bytes)| *bytes > limits.batch_bytes)
+                .all(|(_, items, _)| *items == 1)
+        );
+    }
+    let snapshot = sink.memory.into_snapshot(limits).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let (objects, content, heads) = stores(destination.path());
+    restore_snapshot(&snapshot, &objects, &content, &heads, limits)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn export_neither_reads_nor_writes_content_the_sink_holds() {
+    let fixture = large_fixture().await;
+    let first = export_snapshot(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    let sink = RecordingSink::default();
+    *sink.held.lock().unwrap() = first
+        .manifest
+        .contents
+        .iter()
+        .map(|entry| (entry.id, entry.bytes))
+        .collect();
+    // Content export reads is gone: only the large blob's manifest remains.
+    for entry in &first.manifest.contents {
+        std::fs::remove_file(fixture.content.path(entry.id)).unwrap();
+    }
+
+    let id = export_snapshot_to(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        &sink,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(id, first.manifest_id);
+    assert!(
+        sink.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(kind, _, _)| *kind != 'c')
+    );
+}
+
+#[tokio::test]
+async fn a_held_answer_longer_than_whole_content_is_not_trusted() {
+    let fixture = fixture().await;
+    let first = export_snapshot(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    let sink = RecordingSink::default();
+    *sink.held.lock().unwrap() = first
+        .manifest
+        .contents
+        .iter()
+        .map(|entry| (entry.id, wheat_core::CHUNKED_CONTENT_THRESHOLD + 1))
+        .collect();
+    let id = export_snapshot_to(
+        &fixture.objects,
+        &fixture.content,
+        &fixture.heads,
+        &sink,
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(id, first.manifest_id);
 }
 
 #[tokio::test]

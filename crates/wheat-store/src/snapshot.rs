@@ -6,20 +6,29 @@ use rusqlite::{Connection, params};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wheat_core::{
-    ContentId, INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, ObjectId, RepositoryEnvelopeId,
-    SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, StoreRecordError, VerifiedContent,
-    decode_snapshot_manifest, encode_snapshot_manifest,
+    CHUNKED_CONTENT_THRESHOLD, ContentChunkManifestRecord, ContentId, ContentManifestEntries,
+    INVENTORY_ENTRY_ENCODED_SIZE, InventoryRecord, MAX_CONTENT_CHUNK_MANIFEST_BYTES, ObjectId,
+    RepositoryEnvelopeId, SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE, StoreRecordError, VerifiedContent,
+    decode_content_chunk_manifest, decode_snapshot_manifest, encode_content_chunk_manifest,
+    encode_snapshot_manifest,
 };
 
 use crate::{
     ContentStore, ContentStoreError, ImmutableObjectStore, ObjectStoreError, PublicationError,
     PublicationStore, RepositoryHead, RepositoryPublicationError, RepositoryReader, StoredObject,
+    content_manifest::{ManifestChunks, StoredBlob},
     object_graph::{self, MalformedRadix, Reference},
 };
 
 const INVENTORY_ENTRY_BYTES: usize = INVENTORY_ENTRY_ENCODED_SIZE;
 const MANIFEST_FIXED_BYTES: usize = SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE;
 
+/// Bounds on a snapshot and on what export and restore hold at once. A payload batch
+/// holds at most `batch_items` items of at most `batch_bytes` together, except that
+/// an item larger than `batch_bytes` travels alone; no item is larger than
+/// `max_object_bytes` (an object) or `max_content_bytes` (content stored whole, which
+/// a blob over [`CHUNKED_CONTENT_THRESHOLD`] never is: it travels as its chunk
+/// manifest, with its parts and chunks as content of their own).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotLimits {
     pub max_objects: usize,
@@ -38,7 +47,7 @@ impl Default for SnapshotLimits {
             max_objects: 1_000_000,
             max_contents: 1_000_000,
             max_object_bytes: 16 * 1024 * 1024,
-            max_content_bytes: 256 * 1024 * 1024,
+            max_content_bytes: CHUNKED_CONTENT_THRESHOLD as usize,
             max_total_bytes: 8 * 1024 * 1024 * 1024,
             max_manifest_bytes: 96 * 1024 * 1024,
             batch_items: 256,
@@ -58,7 +67,12 @@ pub struct SnapshotManifest {
     pub head: RepositoryHead,
     pub envelope: RepositoryEnvelopeId,
     pub objects: Vec<InventoryEntry<ObjectId>>,
+    /// Content stored whole, each with its length: blobs up to
+    /// [`CHUNKED_CONTENT_THRESHOLD`], and the parts and chunks of longer ones.
     pub contents: Vec<InventoryEntry<ContentId>>,
+    /// Blobs over [`CHUNKED_CONTENT_THRESHOLD`], each with the length of its encoded
+    /// chunk manifest, which is what the snapshot carries for it.
+    pub chunked: Vec<InventoryEntry<ContentId>>,
 }
 
 impl SnapshotManifest {
@@ -70,6 +84,7 @@ impl SnapshotManifest {
             *self.envelope.as_bytes(),
             inventory_records(&self.objects, ObjectId::as_bytes),
             inventory_records(&self.contents, ContentId::as_bytes),
+            inventory_records(&self.chunked, ContentId::as_bytes),
         )
         .expect("an inventory holds fewer than 2^32 entries")
     }
@@ -84,7 +99,7 @@ impl SnapshotManifest {
         crate::OwnershipManifest {
             owner: crate::Owner::repository(repository_id),
             objects: self.objects.clone(),
-            contents: self.contents.clone(),
+            contents: self.all_contents(),
         }
     }
 
@@ -93,8 +108,29 @@ impl SnapshotManifest {
         crate::OwnershipManifest {
             owner: crate::Owner::snapshot(self.id()),
             objects: self.objects.clone(),
-            contents: self.contents.clone(),
+            contents: self.all_contents(),
         }
+    }
+
+    /// Every content the snapshot keeps alive, whole and chunked, in order.
+    fn all_contents(&self) -> Vec<InventoryEntry<ContentId>> {
+        let mut all = Vec::with_capacity(self.contents.len() + self.chunked.len());
+        let (mut whole, mut chunked) = (self.contents.iter().peekable(), self.chunked.iter());
+        let mut next_chunked = chunked.next();
+        while let Some(entry) = whole.peek() {
+            match next_chunked {
+                Some(blob) if blob.id < entry.id => {
+                    all.push(*blob);
+                    next_chunked = chunked.next();
+                }
+                _ => {
+                    all.push(**entry);
+                    whole.next();
+                }
+            }
+        }
+        all.extend(next_chunked.into_iter().chain(chunked).copied());
+        all
     }
 
     /// Decodes canonical bytes after bounding the manifest and each allocation.
@@ -116,6 +152,7 @@ impl SnapshotManifest {
             envelope: RepositoryEnvelopeId::from_digest(record.envelope),
             objects: inventory_entries(record.objects, ObjectId::from_digest),
             contents: inventory_entries(record.contents, ContentId::from_digest),
+            chunked: inventory_entries(record.chunked, ContentId::from_digest),
         };
         manifest.validate(limits)?;
         Ok(manifest)
@@ -132,9 +169,17 @@ impl SnapshotManifest {
             limits.max_contents,
             limits.max_content_bytes,
         )?;
+        validate_inventory(
+            &self.chunked,
+            limits.max_contents,
+            MAX_CONTENT_CHUNK_MANIFEST_BYTES,
+        )?;
+        if self.contents.len() + self.chunked.len() > limits.max_contents {
+            return Err(SnapshotError::LimitExceeded("inventory count"));
+        }
         let encoded = MANIFEST_FIXED_BYTES
             .checked_add(
-                (self.objects.len() + self.contents.len())
+                (self.objects.len() + self.contents.len() + self.chunked.len())
                     .checked_mul(INVENTORY_ENTRY_BYTES)
                     .ok_or(SnapshotError::LimitExceeded("manifest bytes"))?,
             )
@@ -150,6 +195,7 @@ impl SnapshotManifest {
         let total = self
             .contents
             .iter()
+            .chain(&self.chunked)
             .try_fold(object_bytes, |sum, item| sum.checked_add(item.bytes))
             .ok_or(SnapshotError::LimitExceeded("total bytes"))?;
         if total > limits.max_total_bytes as u64 {
@@ -225,6 +271,12 @@ pub trait SnapshotSource: Send + Sync {
         &self,
         inventory: &[InventoryEntry<ContentId>],
     ) -> Result<ContentBatch, SnapshotError>;
+    /// The encoded chunk manifests of the chunked blobs in `inventory`, as
+    /// [`SnapshotSink::write_chunked`] was given them.
+    async fn read_chunked(
+        &self,
+        inventory: &[InventoryEntry<ContentId>],
+    ) -> Result<ContentBatch, SnapshotError>;
 }
 
 /// A staging snapshot sink. Payload calls are bounded and retry-idempotent; the manifest is the
@@ -232,7 +284,26 @@ pub trait SnapshotSource: Send + Sync {
 #[async_trait]
 pub trait SnapshotSink: Send + Sync {
     async fn write_objects(&self, objects: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError>;
+    /// Content stored whole: blobs up to [`CHUNKED_CONTENT_THRESHOLD`], and the parts
+    /// and chunks of longer ones.
     async fn write_contents(&self, contents: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError>;
+    /// Blobs over [`CHUNKED_CONTENT_THRESHOLD`], each as its encoded chunk manifest
+    /// (`ContentChunkManifestV1`); their parts and chunks go to
+    /// [`Self::write_contents`].
+    async fn write_chunked(&self, manifests: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError>;
+    /// For each of `ids`, its length when this sink holds that content already, from
+    /// an earlier snapshot: export then neither reads it nor writes it again, and
+    /// records the length answered as its inventory's `bytes` (the length of the bytes
+    /// [`Self::write_contents`] was given). Answer only for content
+    /// [`Self::write_contents`] was given, durable in this sink with exactly those
+    /// bytes; never for a manifest [`Self::write_chunked`] was given, as the blob it
+    /// stands for would be taken for whole content. An answer longer than
+    /// `max_content_bytes` (or
+    /// than [`CHUNKED_CONTENT_THRESHOLD`]) is not trusted, and the content is read.
+    /// Holds nothing by default.
+    async fn held_contents(&self, ids: &[ContentId]) -> Result<Vec<Option<u64>>, SnapshotError> {
+        Ok(vec![None; ids.len()])
+    }
     async fn commit_manifest(
         &self,
         id: SnapshotId,
@@ -246,6 +317,8 @@ pub struct NativeSnapshot {
     pub manifest: SnapshotManifest,
     pub objects: ObjectBatch,
     pub contents: ContentBatch,
+    /// The chunked blobs' encoded chunk manifests.
+    pub chunked: ContentBatch,
 }
 
 #[async_trait]
@@ -266,6 +339,13 @@ impl SnapshotSource for NativeSnapshot {
         inventory: &[InventoryEntry<ContentId>],
     ) -> Result<ContentBatch, SnapshotError> {
         select_batch(&self.contents, inventory)
+    }
+
+    async fn read_chunked(
+        &self,
+        inventory: &[InventoryEntry<ContentId>],
+    ) -> Result<ContentBatch, SnapshotError> {
+        select_batch(&self.chunked, inventory)
     }
 }
 
@@ -293,6 +373,7 @@ pub struct MemorySnapshotSink {
     manifest: Mutex<Option<(SnapshotId, Vec<u8>)>>,
     objects: Mutex<ObjectBatch>,
     contents: Mutex<ContentBatch>,
+    chunked: Mutex<ContentBatch>,
 }
 
 #[async_trait]
@@ -307,6 +388,13 @@ impl SnapshotSink for MemorySnapshotSink {
     async fn write_contents(&self, batch: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError> {
         merge_memory_batch(
             &mut self.contents.lock().expect("snapshot mutex poisoned"),
+            batch,
+        )
+    }
+
+    async fn write_chunked(&self, batch: &[(ContentId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        merge_memory_batch(
+            &mut self.chunked.lock().expect("snapshot mutex poisoned"),
             batch,
         )
     }
@@ -356,6 +444,7 @@ impl MemorySnapshotSink {
             manifest,
             objects: self.objects.into_inner().expect("snapshot mutex poisoned"),
             contents: self.contents.into_inner().expect("snapshot mutex poisoned"),
+            chunked: self.chunked.into_inner().expect("snapshot mutex poisoned"),
         };
         validate_native_payload(&snapshot, limits)?;
         Ok(snapshot)
@@ -443,7 +532,7 @@ pub async fn export_snapshot_to<O: ImmutableObjectStore, P: PublicationStore, S:
         if !visit.first {
             continue;
         }
-        if should_flush(&object_batch, batch_bytes, len, limits)? {
+        if should_flush(&object_batch, batch_bytes, len, limits) {
             sink.write_objects(&object_batch).await?;
             object_batch.clear();
             batch_bytes = 0;
@@ -455,44 +544,134 @@ pub async fn export_snapshot_to<O: ImmutableObjectStore, P: PublicationStore, S:
         sink.write_objects(&object_batch).await?;
     }
 
-    let mut content_batch = Vec::with_capacity(limits.batch_items);
-    batch_bytes = 0;
-    while let Some(id) = walk.next_content()? {
-        let bytes = content.get_bounded(id, limits.max_content_bytes.min(limits.batch_bytes))?;
-        account(
-            &mut total,
-            bytes.len(),
-            limits.max_content_bytes,
-            limits.max_total_bytes,
-        )?;
-        walk.record_content(id, bytes.len())?;
-        if should_flush(&content_batch, batch_bytes, bytes.len(), limits)? {
-            sink.write_contents(&content_batch).await?;
-            content_batch.clear();
-            batch_bytes = 0;
-        }
-        batch_bytes += bytes.len();
-        content_batch.push((id, bytes));
-    }
-    if !content_batch.is_empty() {
-        sink.write_contents(&content_batch).await?;
-    }
+    export_contents(content, sink, &mut walk, &mut total, limits).await?;
 
-    // The lazy walk bounds every read before semantic verification is allowed to revisit the graph.
-    RepositoryReader::new(objects, content)
-        .validate_envelope(head.envelope)
-        .await?;
+    // No semantic validation here: the head was validated when it was published, its
+    // objects and content are immutable and named by their hashes, the walk checked
+    // every object it read and every content it exported, and the sink holds the
+    // rest as an earlier export gave it. Restoring validates the whole envelope
+    // before it moves any head, so a snapshot is checked where it is trusted.
     let manifest = SnapshotManifest {
         head,
         envelope: head.envelope,
         objects: walk.object_inventory()?,
         contents: walk.content_inventory()?,
+        chunked: walk.chunked_inventory()?,
     };
     manifest.validate(limits)?;
     let bytes = manifest.canonical_bytes();
     let id = SnapshotId(*blake3::hash(&bytes).as_bytes());
     sink.commit_manifest(id, &bytes).await?;
     Ok(id)
+}
+
+/// Writes every content the walk reached to `sink`, in batches: whole content to
+/// [`SnapshotSink::write_contents`], skipping what the sink says it holds, and
+/// chunked blobs' manifests to [`SnapshotSink::write_chunked`], with their parts and
+/// chunks walked as content of their own.
+async fn export_contents<S: SnapshotSink>(
+    content: &ContentStore,
+    sink: &S,
+    walk: &mut ClosureWalk,
+    total: &mut usize,
+    limits: SnapshotLimits,
+) -> Result<(), SnapshotError> {
+    let whole_max = limits
+        .max_content_bytes
+        .min(CHUNKED_CONTENT_THRESHOLD as usize);
+    let mut ids = Vec::with_capacity(limits.batch_items);
+    let mut wholes = PayloadBatch::new(limits);
+    let mut chunked = PayloadBatch::new(limits);
+    loop {
+        walk.next_contents(limits.batch_items, &mut ids)?;
+        if ids.is_empty() {
+            break;
+        }
+        let held = sink.held_contents(&ids).await?;
+        if held.len() != ids.len() {
+            return Err(SnapshotError::BatchBounds);
+        }
+        for (&id, held) in ids.iter().zip(held) {
+            let held = held
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .filter(|&bytes| bytes <= whole_max);
+            if let Some(bytes) = held {
+                account(total, bytes, whole_max, limits.max_total_bytes)?;
+                walk.record_content(id, bytes)?;
+                continue;
+            }
+            match content.whole_or_manifest(id, whole_max)? {
+                StoredBlob::Whole(bytes) => {
+                    account(total, bytes.len(), whole_max, limits.max_total_bytes)?;
+                    walk.record_content(id, bytes.len())?;
+                    if let Some(full) = wholes.push(id, bytes) {
+                        sink.write_contents(full).await?;
+                    }
+                }
+                StoredBlob::Chunked(manifest) => {
+                    let bytes = encode_content_chunk_manifest(&manifest)
+                        .map_err(|_| SnapshotError::InvalidManifest("chunk manifest"))?;
+                    account(
+                        total,
+                        bytes.len(),
+                        MAX_CONTENT_CHUNK_MANIFEST_BYTES,
+                        limits.max_total_bytes,
+                    )?;
+                    walk.record_chunked(id, bytes.len())?;
+                    walk.expand_chunked(id, manifest, content)?;
+                    if let Some(full) = chunked.push(id, bytes) {
+                        sink.write_chunked(full).await?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rest) = wholes.finish() {
+        sink.write_contents(rest).await?;
+    }
+    if let Some(rest) = chunked.finish() {
+        sink.write_chunked(rest).await?;
+    }
+    Ok(())
+}
+
+/// Payload items gathered into batches of at most `batch_items` items and
+/// `batch_bytes` bytes, but for an item larger than that, which travels alone.
+struct PayloadBatch<I> {
+    items: Vec<(I, Vec<u8>)>,
+    bytes: usize,
+    limits: SnapshotLimits,
+    /// The batch handed out last, whose buffer the next one reuses.
+    full: Vec<(I, Vec<u8>)>,
+}
+
+impl<I> PayloadBatch<I> {
+    fn new(limits: SnapshotLimits) -> Self {
+        Self {
+            items: Vec::with_capacity(limits.batch_items),
+            bytes: 0,
+            limits,
+            full: Vec::with_capacity(limits.batch_items),
+        }
+    }
+
+    /// Adds an item, and returns the batch it closes, which is to be written now.
+    fn push(&mut self, id: I, bytes: Vec<u8>) -> Option<&[(I, Vec<u8>)]> {
+        let closes = should_flush(&self.items, self.bytes, bytes.len(), self.limits);
+        if closes {
+            self.full.clear();
+            std::mem::swap(&mut self.full, &mut self.items);
+            self.bytes = 0;
+        }
+        self.bytes += bytes.len();
+        self.items.push((id, bytes));
+        closes.then_some(self.full.as_slice())
+    }
+
+    /// The last batch, if it holds anything.
+    fn finish(&mut self) -> Option<&[(I, Vec<u8>)]> {
+        (!self.items.is_empty()).then_some(self.items.as_slice())
+    }
 }
 
 /// How many visits the walk allows per object in the inventory limit. A radix node's
@@ -599,7 +778,11 @@ impl ClosureWalk {
                  place BLOB NOT NULL,
                  first INTEGER NOT NULL
              );
-             CREATE TABLE contents (id BLOB PRIMARY KEY, bytes INTEGER) WITHOUT ROWID;
+             CREATE TABLE contents (
+                 id BLOB PRIMARY KEY,
+                 bytes INTEGER,
+                 chunked INTEGER NOT NULL DEFAULT 0
+             ) WITHOUT ROWID;
              CREATE TABLE pending_contents (seq INTEGER PRIMARY KEY, id BLOB NOT NULL);",
         )?;
         Ok(Self {
@@ -718,16 +901,20 @@ impl ClosureWalk {
         }))
     }
 
-    fn next_content(&self) -> Result<Option<ContentId>, SnapshotError> {
+    /// Takes up to `count` pending contents into `ids`, which it clears first.
+    fn next_contents(&self, count: usize, ids: &mut Vec<ContentId>) -> Result<(), SnapshotError> {
+        ids.clear();
         let mut statement = self.connection.prepare_cached(
-            "DELETE FROM pending_contents WHERE seq = (SELECT max(seq) FROM pending_contents)
+            "DELETE FROM pending_contents WHERE seq IN (
+                 SELECT seq FROM pending_contents ORDER BY seq DESC LIMIT ?1
+             )
              RETURNING id",
         )?;
-        let mut rows = statement.query([])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(ContentId::from_digest(digest(blob(row, 0)?)?)))
+        let mut rows = statement.query([i64::try_from(count).unwrap_or(i64::MAX)])?;
+        while let Some(row) = rows.next()? {
+            ids.push(ContentId::from_digest(digest(blob(row, 0)?)?));
+        }
+        Ok(())
     }
 
     fn record_object(&self, id: ObjectId, bytes: usize) -> Result<(), SnapshotError> {
@@ -750,6 +937,37 @@ impl ClosureWalk {
         Ok(())
     }
 
+    /// Records `id` as a chunked blob whose encoded chunk manifest is `bytes` long.
+    fn record_chunked(&self, id: ContentId, bytes: usize) -> Result<(), SnapshotError> {
+        self.connection
+            .prepare_cached("UPDATE contents SET bytes = ?2, chunked = 1 WHERE id = ?1")?
+            .execute(params![
+                id.as_bytes().as_slice(),
+                i64::try_from(bytes).map_err(|_| SnapshotError::LimitExceeded("item bytes"))?
+            ])?;
+        Ok(())
+    }
+
+    /// Enqueues the parts and chunks of the chunked blob `id`, whose manifest is
+    /// `manifest`, reading its parts from `content`.
+    fn expand_chunked(
+        &mut self,
+        id: ContentId,
+        manifest: ContentChunkManifestRecord,
+        content: &ContentStore,
+    ) -> Result<(), SnapshotError> {
+        if let ContentManifestEntries::Parts(parts) = &manifest.entries {
+            for part in parts {
+                self.enqueue_content(part.id)?;
+            }
+        }
+        let mut chunks = ManifestChunks::new(id, manifest);
+        while let Some(chunk) = chunks.next(|part, max| content.get_bounded(part, max))? {
+            self.enqueue_content(chunk.id)?;
+        }
+        Ok(())
+    }
+
     fn object_inventory(&self) -> Result<Vec<InventoryEntry<ObjectId>>, SnapshotError> {
         let mut statement = self
             .connection
@@ -766,12 +984,25 @@ impl ClosureWalk {
         Ok(inventory)
     }
 
+    /// The content stored whole, with its lengths.
     fn content_inventory(&self) -> Result<Vec<InventoryEntry<ContentId>>, SnapshotError> {
+        self.contents_where(false)
+    }
+
+    /// The chunked blobs, with their encoded manifests' lengths.
+    fn chunked_inventory(&self) -> Result<Vec<InventoryEntry<ContentId>>, SnapshotError> {
+        self.contents_where(true)
+    }
+
+    fn contents_where(
+        &self,
+        chunked: bool,
+    ) -> Result<Vec<InventoryEntry<ContentId>>, SnapshotError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, bytes FROM contents ORDER BY id")?;
-        let mut rows = statement.query([])?;
-        let mut inventory = Vec::with_capacity(self.content_count);
+            .prepare("SELECT id, bytes FROM contents WHERE chunked = ?1 ORDER BY id")?;
+        let mut rows = statement.query([chunked])?;
+        let mut inventory = Vec::new();
         while let Some(row) = rows.next()? {
             inventory.push(InventoryEntry {
                 id: ContentId::from_digest(digest(blob(row, 0)?)?),
@@ -798,18 +1029,18 @@ impl ClosureWalk {
     }
 }
 
+/// Whether `batch` is to be written before an item of `next_bytes` joins it: it is
+/// full, or the item would take it past `batch_bytes`. An item larger than that
+/// closes the batch before it and travels alone, as [`inventory_batch_end`] expects.
 fn should_flush<I>(
     batch: &[(I, Vec<u8>)],
     batch_bytes: usize,
     next_bytes: usize,
     limits: SnapshotLimits,
-) -> Result<bool, SnapshotError> {
-    if next_bytes > limits.batch_bytes {
-        return Err(SnapshotError::LimitExceeded("item exceeds batch bytes"));
-    }
-    Ok(!batch.is_empty()
+) -> bool {
+    !batch.is_empty()
         && (batch.len() == limits.batch_items
-            || batch_bytes.saturating_add(next_bytes) > limits.batch_bytes))
+            || batch_bytes.saturating_add(next_bytes) > limits.batch_bytes)
 }
 
 pub async fn restore_snapshot<O: ImmutableObjectStore, P: PublicationStore>(
@@ -894,6 +1125,12 @@ trait PayloadTarget: Send + Sync {
     async fn put_objects(&self, batch: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError>;
     /// Stores `batch`, checked against its inventory by [`validate_batch_shape`].
     async fn put_contents(&self, batch: ContentBatch) -> Result<(), SnapshotError>;
+    /// Stores the chunked blob `id` as `manifest`, whose parts and chunks are stored.
+    async fn put_chunked(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), SnapshotError>;
 }
 
 struct Stores<'a, O> {
@@ -917,6 +1154,14 @@ impl<O: ImmutableObjectStore> PayloadTarget for Stores<'_, O> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self.content.put_many(&verified, 16)?)
     }
+
+    async fn put_chunked(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), SnapshotError> {
+        Ok(self.content.put_checked_manifest(id, manifest)?)
+    }
 }
 
 #[async_trait]
@@ -934,12 +1179,22 @@ impl<R: crate::RepositoryStore> PayloadTarget for crate::RepositoryStage<R> {
                     .map_err(|_| SnapshotError::InventoryMismatch)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.put_content(verified)
-            .await
-            .map_err(|error| match error {
-                crate::RepositoryStoreError::Objects(error) => SnapshotError::Object(error),
-                crate::RepositoryStoreError::Content(error) => SnapshotError::Content(error),
-            })
+        self.put_content(verified).await.map_err(stage_error)
+    }
+
+    async fn put_chunked(
+        &self,
+        id: ContentId,
+        manifest: &ContentChunkManifestRecord,
+    ) -> Result<(), SnapshotError> {
+        self.put_manifest(id, manifest).await.map_err(stage_error)
+    }
+}
+
+fn stage_error(error: crate::RepositoryStoreError) -> SnapshotError {
+    match error {
+        crate::RepositoryStoreError::Objects(error) => SnapshotError::Object(error),
+        crate::RepositoryStoreError::Content(error) => SnapshotError::Content(error),
     }
 }
 
@@ -969,7 +1224,25 @@ async fn copy_payload<S: SnapshotSource, T: PayloadTarget>(
         target.put_contents(batch).await?;
         start = end;
     }
+    // Every part and chunk is stored by now, so each blob's manifest can be checked.
+    start = 0;
+    while start < manifest.chunked.len() {
+        let end = inventory_batch_end(&manifest.chunked, start, limits)?;
+        let inventory = &manifest.chunked[start..end];
+        let batch = source.read_chunked(inventory).await?;
+        validate_batch_shape(&batch, inventory, limits)?;
+        for (id, bytes) in &batch {
+            target.put_chunked(*id, &decode_chunked(bytes)?).await?;
+        }
+        start = end;
+    }
     Ok(())
+}
+
+/// A chunked blob's manifest, as a snapshot carries it.
+fn decode_chunked(bytes: &[u8]) -> Result<ContentChunkManifestRecord, SnapshotError> {
+    decode_content_chunk_manifest(bytes)
+        .map_err(|_| SnapshotError::InvalidManifest("chunk manifest does not decode"))
 }
 
 /// Refuses a snapshot whose envelope's closure is not exactly its inventory.
@@ -980,7 +1253,10 @@ async fn check_exact_closure<O: ImmutableObjectStore>(
     limits: SnapshotLimits,
 ) -> Result<(), SnapshotError> {
     let actual = exact_closure_inventory(objects, content, manifest.envelope, limits).await?;
-    if actual.objects != manifest.objects || actual.contents != manifest.contents {
+    if actual.objects != manifest.objects
+        || actual.contents != manifest.contents
+        || actual.chunked != manifest.chunked
+    {
         return Err(SnapshotError::InventoryMismatch);
     }
     Ok(())
@@ -1009,21 +1285,48 @@ async fn exact_closure_inventory<O: ImmutableObjectStore>(
         }
         walk.follow(&stored, &visit)?;
     }
-    while let Some(id) = walk.next_content()? {
-        let bytes = content.get_bounded(id, limits.max_content_bytes)?;
-        account(
-            &mut total,
-            bytes.len(),
-            limits.max_content_bytes,
-            limits.max_total_bytes,
-        )?;
-        walk.record_content(id, bytes.len())?;
+    let whole_max = limits
+        .max_content_bytes
+        .min(CHUNKED_CONTENT_THRESHOLD as usize);
+    let mut ids = Vec::with_capacity(limits.batch_items);
+    loop {
+        walk.next_contents(limits.batch_items, &mut ids)?;
+        if ids.is_empty() {
+            break;
+        }
+        for &id in &ids {
+            let length = content.logical_length(id)?;
+            if !crate::content_store::is_chunked_length(length) {
+                let bytes = usize::try_from(length)
+                    .map_err(|_| SnapshotError::LimitExceeded("item bytes"))?;
+                account(&mut total, bytes, whole_max, limits.max_total_bytes)?;
+                walk.record_content(id, bytes)?;
+                continue;
+            }
+            match content.chunk_manifest(id)? {
+                None => return Err(SnapshotError::InventoryMismatch),
+                Some(manifest) => {
+                    let bytes = encode_content_chunk_manifest(&manifest)
+                        .map_err(|_| SnapshotError::InvalidManifest("chunk manifest"))?
+                        .len();
+                    account(
+                        &mut total,
+                        bytes,
+                        MAX_CONTENT_CHUNK_MANIFEST_BYTES,
+                        limits.max_total_bytes,
+                    )?;
+                    walk.record_chunked(id, bytes)?;
+                    walk.expand_chunked(id, manifest, content)?;
+                }
+            }
+        }
     }
     Ok(SnapshotManifest {
         head: RepositoryHead::initial(envelope),
         envelope,
         objects: walk.object_inventory()?,
         contents: walk.content_inventory()?,
+        chunked: walk.chunked_inventory()?,
     })
 }
 
@@ -1033,6 +1336,7 @@ fn validate_native_payload(
 ) -> Result<(), SnapshotError> {
     if snapshot.objects.len() != snapshot.manifest.objects.len()
         || snapshot.contents.len() != snapshot.manifest.contents.len()
+        || snapshot.chunked.len() != snapshot.manifest.chunked.len()
     {
         return Err(SnapshotError::InventoryMismatch);
     }
@@ -1050,6 +1354,14 @@ fn validate_native_payload(
             return Err(SnapshotError::InventoryMismatch);
         }
     }
+    // A chunked blob's ID is the hash of its bytes, not of its manifest, which only
+    // restoring can check against the chunks.
+    for ((id, bytes), entry) in snapshot.chunked.iter().zip(&snapshot.manifest.chunked) {
+        if id != &entry.id || bytes.len() as u64 != entry.bytes {
+            return Err(SnapshotError::InventoryMismatch);
+        }
+        decode_chunked(bytes)?;
+    }
     snapshot.manifest.validate(limits)
 }
 
@@ -1062,7 +1374,8 @@ fn validate_batch_shape<I: Eq>(
         .iter()
         .try_fold(0usize, |sum, item| sum.checked_add(item.1.len()))
         .ok_or(SnapshotError::BatchBounds)?;
-    if batch.len() > limits.batch_items || bytes > limits.batch_bytes {
+    // An item larger than `batch_bytes` travels alone.
+    if batch.len() > limits.batch_items || (batch.len() > 1 && bytes > limits.batch_bytes) {
         return Err(SnapshotError::BatchBounds);
     }
     if batch.len() != inventory.len()
@@ -1091,6 +1404,8 @@ fn validate_object_batch(
     Ok(())
 }
 
+/// Where the batch of `items` from `start` ends: it holds at most `batch_items` items
+/// and `batch_bytes` bytes, but for an item larger than that, which travels alone.
 fn inventory_batch_end<I>(
     items: &[InventoryEntry<I>],
     start: usize,
@@ -1101,9 +1416,6 @@ fn inventory_batch_end<I>(
     while end < items.len() && end - start < limits.batch_items {
         let next = usize::try_from(items[end].bytes)
             .map_err(|_| SnapshotError::LimitExceeded("item bytes"))?;
-        if next > limits.batch_bytes {
-            return Err(SnapshotError::LimitExceeded("item exceeds batch bytes"));
-        }
         if end > start && bytes.saturating_add(next) > limits.batch_bytes {
             break;
         }

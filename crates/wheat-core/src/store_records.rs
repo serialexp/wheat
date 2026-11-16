@@ -23,7 +23,7 @@ pub const MATERIALIZATION_PROGRESS_RECORD_ENCODED_SIZE: usize = 36;
 /// Encoded size of one inventory entry in a snapshot or ownership manifest.
 pub const INVENTORY_ENTRY_ENCODED_SIZE: usize = 40;
 /// Encoded size of a snapshot manifest with empty inventories.
-pub const SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE: usize = 86;
+pub const SNAPSHOT_MANIFEST_FIXED_ENCODED_SIZE: usize = 90;
 /// A blob longer than this is stored as content-defined chunks and a manifest; one
 /// this long or shorter is stored whole.
 pub const CHUNKED_CONTENT_THRESHOLD: u64 = 16 << 20;
@@ -277,6 +277,7 @@ pub struct SnapshotManifestRecord {
     pub envelope: [u8; 32],
     pub objects: Vec<InventoryRecord>,
     pub contents: Vec<InventoryRecord>,
+    pub chunked: Vec<InventoryRecord>,
 }
 
 /// The fields of one materialization progress record, which its checksum covers.
@@ -796,28 +797,34 @@ pub fn encode_snapshot_manifest(
     envelope: [u8; 32],
     objects: impl ExactSizeIterator<Item = InventoryRecord>,
     contents: impl ExactSizeIterator<Item = InventoryRecord>,
+    chunked: impl ExactSizeIterator<Item = InventoryRecord>,
 ) -> Result<Vec<u8>, StoreRecordError> {
     encoded(
-        wire::SnapshotManifestV1Input {
+        wire::SnapshotManifestV2Input {
             head_generation,
             head_envelope: digest(head_envelope),
             envelope: digest(envelope),
             objects: inventory_wire(objects)?,
             contents: inventory_wire(contents)?,
+            chunked: inventory_wire(chunked)?,
         }
         .encode(),
     )
 }
+
 /// Decodes a snapshot manifest holding at most `max_objects` objects and
-/// `max_contents` contents. The generated decoder reserves no more entries
-/// than the bytes left can hold, so a forged count costs at most the input.
+/// `max_contents` contents, whole and chunked together. The generated decoder
+/// reserves no more entries than the bytes left can hold, so a forged count costs
+/// at most the input.
 pub fn decode_snapshot_manifest(
     bytes: &[u8],
     max_objects: usize,
     max_contents: usize,
 ) -> Result<SnapshotManifestRecord, StoreRecordError> {
-    let w = wire::SnapshotManifestV1::decode(bytes).map_err(decode_error)?;
-    if w.objects.len() > max_objects || w.contents.len() > max_contents {
+    let w = wire::SnapshotManifestV2::decode(bytes).map_err(decode_error)?;
+    if w.objects.len() > max_objects
+        || w.contents.len().saturating_add(w.chunked.len()) > max_contents
+    {
         return Err(StoreRecordError::InvalidCount);
     }
     let reencoded = w.encode();
@@ -827,6 +834,7 @@ pub fn decode_snapshot_manifest(
         envelope: digest_array(w.envelope)?,
         objects: inventory_domain(w.objects)?,
         contents: inventory_domain(w.contents)?,
+        chunked: inventory_domain(w.chunked)?,
     };
     checked(bytes, manifest, reencoded)
 }

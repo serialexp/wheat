@@ -120,6 +120,53 @@ async fn a_restore_into_another_repository_stores_and_names_the_snapshot() {
 }
 
 #[tokio::test]
+async fn a_restore_stores_a_blob_over_the_threshold_as_its_chunks() {
+    let source = named_repository().await;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut large = Vec::new();
+    while large.len() < wheat_core::CHUNKED_CONTENT_THRESHOLD as usize + (3 << 20) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        large.extend_from_slice(&state.to_le_bytes());
+    }
+    // `commit` takes a file's bytes for the life of the test.
+    let large: &'static [u8] = large.leak();
+    let one = commit(
+        &source.entry,
+        1,
+        source.repo.base,
+        Absent,
+        "large.bin",
+        large,
+    )
+    .await;
+    let taken = snapshot(&source).await;
+    assert_eq!(taken.manifest.chunked.len(), 1);
+    let target = named_repository().await;
+
+    let restored = restore_from(
+        &target.entry,
+        &principal(),
+        Arc::new(taken),
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(restored.moved);
+    let content = target.repo.objects.content_store();
+    assert!(content.chunk_manifest(id(large)).unwrap().is_some());
+    content.verify(id(large)).unwrap();
+    assert_eq!(
+        file(&target.repo, one, "large.bin").await.as_deref(),
+        Some(large)
+    );
+    let named = target.naming.calls.lock().unwrap().concat();
+    assert!(named.contains(&id(large)), "the blob is named");
+}
+
+#[tokio::test]
 async fn a_snapshot_that_is_not_the_one_claimed_leaves_the_head() {
     let source = named_repository().await;
     commit(

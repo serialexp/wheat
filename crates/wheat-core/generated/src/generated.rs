@@ -9756,16 +9756,17 @@ impl InventoryEntryV1 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SnapshotManifestV1Input {
+pub struct SnapshotManifestV2Input {
     pub head_generation: u64,
     pub head_envelope: Digest256,
     pub envelope: Digest256,
     pub objects: Vec<InventoryEntryV1>,
     pub contents: Vec<InventoryEntryV1>,
+    pub chunked: Vec<InventoryEntryV1>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SnapshotManifestV1Output {
+pub struct SnapshotManifestV2Output {
     pub magic: u32,
     pub version: u16,
     pub head_generation: u64,
@@ -9773,11 +9774,12 @@ pub struct SnapshotManifestV1Output {
     pub envelope: Digest256,
     pub objects: Vec<InventoryEntryV1>,
     pub contents: Vec<InventoryEntryV1>,
+    pub chunked: Vec<InventoryEntryV1>,
 }
 
-pub type SnapshotManifestV1 = SnapshotManifestV1Output;
+pub type SnapshotManifestV2 = SnapshotManifestV2Output;
 
-impl SnapshotManifestV1Input {
+impl SnapshotManifestV2Input {
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
         self.encode()
     }
@@ -9790,7 +9792,7 @@ impl SnapshotManifestV1Input {
 
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
         encoder.write_u32_be(1464357710);
-        encoder.write_u16_be(1);
+        encoder.write_u16_be(2);
         encoder.write_u64_be(self.head_generation);
         self.head_envelope.encode_into(encoder)?;
         self.envelope.encode_into(encoder)?;
@@ -9802,11 +9804,15 @@ impl SnapshotManifestV1Input {
         for item in &self.contents {
             item.encode_into(encoder)?;
         }
+        encoder.write_u32_be(self.chunked.len() as u32);
+        for item in &self.chunked {
+            item.encode_into(encoder)?;
+        }
         Ok(())
     }
 }
 
-impl SnapshotManifestV1Output {
+impl SnapshotManifestV2Output {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut decoder = BitStreamDecoder::new(bytes, BitOrder::MsbFirst);
         Self::decode_with_decoder(&mut decoder)
@@ -9821,9 +9827,9 @@ impl SnapshotManifestV1Output {
             )));
         }
         let version = decoder.read_u16_be()?;
-        if version != 1u16 {
+        if version != 2u16 {
             return Err(binschema_runtime::BinSchemaError::InvalidVariant(format!(
-                "expected 1, got {}",
+                "expected 2, got {}",
                 version
             )));
         }
@@ -9842,6 +9848,12 @@ impl SnapshotManifestV1Output {
             let item = InventoryEntryV1::decode_with_decoder(decoder)?;
             contents.push(item);
         }
+        let length = decoder.read_u32_be()? as usize;
+        let mut chunked = Vec::with_capacity(decoder.capacity_hint_sized(length, 40));
+        for _ in 0..length {
+            let item = InventoryEntryV1::decode_with_decoder(decoder)?;
+            chunked.push(item);
+        }
         Ok(Self {
             magic,
             version,
@@ -9850,42 +9862,45 @@ impl SnapshotManifestV1Output {
             envelope,
             objects,
             contents,
+            chunked,
         })
     }
     pub fn encode_measuring(&self) -> Result<Vec<u8>> {
-        SnapshotManifestV1Input::from(self.clone()).encode_measuring()
+        SnapshotManifestV2Input::from(self.clone()).encode_measuring()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        SnapshotManifestV1Input::from(self.clone()).encode()
+        SnapshotManifestV2Input::from(self.clone()).encode()
     }
     pub fn encode_into(&self, encoder: &mut BitStreamEncoder) -> Result<()> {
-        SnapshotManifestV1Input::from(self.clone()).encode_into(encoder)
+        SnapshotManifestV2Input::from(self.clone()).encode_into(encoder)
     }
 }
 
-impl From<SnapshotManifestV1Output> for SnapshotManifestV1Input {
-    fn from(o: SnapshotManifestV1Output) -> Self {
+impl From<SnapshotManifestV2Output> for SnapshotManifestV2Input {
+    fn from(o: SnapshotManifestV2Output) -> Self {
         Self {
             head_generation: o.head_generation,
             head_envelope: o.head_envelope,
             envelope: o.envelope,
             objects: o.objects,
             contents: o.contents,
+            chunked: o.chunked,
         }
     }
 }
 
-impl From<SnapshotManifestV1Input> for SnapshotManifestV1Output {
-    fn from(i: SnapshotManifestV1Input) -> Self {
+impl From<SnapshotManifestV2Input> for SnapshotManifestV2Output {
+    fn from(i: SnapshotManifestV2Input) -> Self {
         Self {
             magic: 1464357710u32,
-            version: 1u16,
+            version: 2u16,
             head_generation: i.head_generation,
             head_envelope: i.head_envelope,
             envelope: i.envelope,
             objects: i.objects,
             contents: i.contents,
+            chunked: i.chunked,
         }
     }
 }

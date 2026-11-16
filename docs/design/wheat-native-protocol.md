@@ -1287,6 +1287,23 @@ the envelope's closure is exactly the inventory. The envelope is then validated 
 case `server_restore`: restoring 101,244 objects (160,000 files) into an empty
 repository reads 2.05 objects of its store per snapshot object, against a budget of 4.
 
+Two additions for Gothab's daily snapshots (2026-11-16, walrus). A snapshot carries
+blobs over 16 MiB (see `wheat-large-content.md`). And `SnapshotSink::held_contents`
+lets a sink say which content it holds from an earlier snapshot, and how long it is.
+Export asks once per batch of ids, and for content the sink holds it neither reads
+the store nor writes the content, recording the length the sink gave as the
+inventory's `bytes`. The sink answers only for content it was given through
+`write_contents`, durable and byte for byte; never for a chunked blob's manifest
+from `write_chunked`. An answer longer than whole content can be is not trusted.
+For that to save the reads, export no longer validates the envelope semantically
+after its walk: that validation reads every content again (it verifies them all,
+and edit replay confirms the edited files). The head was validated when it was
+published; its objects and content are immutable and named by their hashes; the
+walk checks every object it reads and every content it exports. A snapshot is
+validated in full where it is trusted: on restore. Bench case `snapshot_export`:
+re-exporting 59,631 items into a sink holding all 40,050 contents, with the
+source's content deleted, writes no content.
+
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new
 publishes with a retryable `Error` (code 503; the CLI reports `remote_unavailable`),
