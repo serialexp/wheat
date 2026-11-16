@@ -34,6 +34,8 @@ mod protocol_test;
 mod publish_test;
 #[path = "../registry_test.rs"]
 mod registry_test;
+#[path = "../restore_test.rs"]
+mod restore_test;
 #[path = "../s3_packed_test.rs"]
 mod s3_packed_test;
 #[path = "../server_stage_test.rs"]

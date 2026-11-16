@@ -217,9 +217,9 @@ pub async fn accept<S: RepositoryStore + 'static>(
 
 /// [`accept`] for a forced publish of `proposed` onto `expected` that the caller
 /// validated already, as arriving on `expected`, in `staged`: a mirror, which can
-/// validate incrementally when the remote's history extends the head. A forced
-/// publish is accepted only onto exactly the head it names, so the validation holds.
-#[cfg(feature = "mirror")]
+/// validate incrementally when the remote's history extends the head, or a restore
+/// ([`crate::replace`]). A forced publish is accepted only onto exactly the head it
+/// names, so the validation holds.
 pub(crate) async fn accept_validated_forced<S: RepositoryStore + 'static>(
     entry: &Arc<RepositoryEntry>,
     staged: &Arc<RepositoryStage<S>>,

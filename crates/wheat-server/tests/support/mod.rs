@@ -8,6 +8,8 @@
 //! Each test binary uses a different part of this module.
 #![allow(dead_code)]
 
+pub mod served;
+
 use std::net::SocketAddr;
 
 use futures::{SinkExt, StreamExt};

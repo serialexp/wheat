@@ -8,7 +8,8 @@
 //! envelope then), and the move joins the repository's group commit as a forced
 //! publish naming the current head does: the content it relies on named first when
 //! the network is told that ([`crate::naming`]), and made durable in its batch. No
-//! publish hooks run: the embedder tells its own listeners.
+//! publish hooks run: the embedder tells its own listeners. [`crate::restore`] moves
+//! a head the same way, to a snapshot.
 //!
 //! What arrived is validated before it joins: only what it adds, when the remote's
 //! history extends the current head's (the usual case: the remote moved on since the
@@ -21,21 +22,17 @@
 
 use std::{future::Future, sync::Arc};
 
-use tokio::time::Instant;
-use tracing::{Instrument as _, debug_span, warn};
-use wheat_core::{RepositoryEnvelopeId, publish_request_digest};
+use wheat_core::RepositoryEnvelopeId;
 use wheat_remote::{FetchedContent, FetchedObjects, RemoteRepoState, WheatSession, WheatUrl};
-use wheat_store::{Arrival, RepositoryHead, RepositoryReader, RepositoryStage};
+use wheat_store::{RepositoryHead, RepositoryStage};
 
 use crate::{
     access::Principal,
-    commit::{self, CommitFailure},
-    error_text::chain,
-    naming::Named,
+    commit::CommitFailure,
     network::Network,
-    receipt::PublishKey,
     registry::RepositoryEntry,
-    write::{self, WriteFailure},
+    replace::{Replacement, Validation},
+    write::WriteFailure,
 };
 
 /// What [`mirror`] did.
@@ -134,22 +131,12 @@ where
     O: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<(WheatSession, RemoteRepoState)>>,
 {
-    // Held until the head has moved, so a quiesce waits for the fetch (see the
-    // module's documentation).
-    let writing = write::begin(entry).map_err(MirrorFailure::Write)?;
-    // Before anything is fetched: each stamp of the fetched content is newer.
-    let opened = Instant::now();
-    let current =
-        entry.heads.head().await.map_err(|e| {
-            CommitFailure::Internal(format!("mirror: read the head: {}", chain(&e)))
-        })?;
-    let staged = Arc::new(RepositoryStage::new(
-        entry.network.clone(),
-        write::STAGE_OBJECTS,
-        write::STAGE_BYTES,
-    ));
+    let replacement = Replacement::begin(entry)
+        .await
+        .map_err(MirrorFailure::Write)?;
+    let current = replacement.current;
     let fetched = {
-        let staged = Arc::clone(&staged);
+        let staged = Arc::clone(&replacement.staged);
         // The stores read and write the disk synchronously, so the fetch runs on a
         // thread for blocking work.
         crate::blocking::drive(move || async move { fetch(&staged, open, current.envelope).await })
@@ -165,57 +152,16 @@ where
             content: FetchedContent::default(),
         });
     };
-
-    {
-        let staged = Arc::clone(&staged);
-        crate::blocking::drive(
-            move || async move { validate(&staged, current.envelope, remote).await },
+    let head = replacement
+        .finish(
+            entry,
+            principal,
+            remote,
+            Validation::ExtendingWhenItCan,
+            "wheat-server mirror publish key v1",
         )
         .await
-        .map_err(|e| CommitFailure::Internal(format!("mirror: validation stopped: {e}")))?
-        .map_err(|message| CommitFailure::Rejected {
-            head: current,
-            message: format!("the remote's head failed validation: {message}"),
-        })?;
-    }
-
-    let named = match &entry.network.naming {
-        None => None,
-        Some(naming) => {
-            let needed = {
-                let staged = Arc::clone(&staged);
-                crate::blocking::drive(move || async move {
-                    needed(&staged, current.envelope, remote).await
-                })
-                .await
-                .map_err(|e| CommitFailure::Internal(format!("mirror: naming stopped: {e}")))?
-                .map_err(|e| CommitFailure::Internal(format!("mirror: {e}")))?
-            };
-            if let Err(e) = naming
-                .named(&needed)
-                .instrument(debug_span!("server_mirror_name", ids = needed.len()))
-                .await
-            {
-                warn!(error = %e, "mirror: naming its content failed");
-                return Err(CommitFailure::Failed {
-                    head: current,
-                    message: format!("naming the mirrored content failed: {e}; mirror again"),
-                }
-                .into());
-            }
-            Some(Named {
-                since: opened,
-                ids: needed,
-            })
-        }
-    };
-
-    let key = mirror_key(principal, current, remote)?;
-    let accepted =
-        commit::accept_validated_forced(entry, &staged, key, current.envelope, remote, named)
-            .await?;
-    let head = accepted.durable().await?;
-    drop(writing);
+        .map_err(MirrorFailure::Write)?;
     Ok(Mirrored {
         head,
         moved: true,
@@ -252,67 +198,4 @@ where
             .context("fetch the remote's content")?;
     wheat_remote::close(&mut session).await?;
     Ok(Some((state.envelope, objects, content)))
-}
-
-/// `remote`, as arriving on `current`: only what it adds when it extends `current`,
-/// whole when it does not.
-async fn validate(
-    staged: &RepositoryStage<Network>,
-    current: RepositoryEnvelopeId,
-    remote: RepositoryEnvelopeId,
-) -> Result<(), String> {
-    let reader = RepositoryReader::new(staged, staged.content());
-    if reader
-        .validate_arrival(remote, Arrival::Extends(current))
-        .await
-        .is_ok()
-    {
-        return Ok(());
-    }
-    reader
-        .validate_arrival(remote, Arrival::Forced)
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// What the head moving from `current` to `remote` relies on.
-async fn needed(
-    staged: &RepositoryStage<Network>,
-    current: RepositoryEnvelopeId,
-    remote: RepositoryEnvelopeId,
-) -> Result<Vec<wheat_core::ContentId>, String> {
-    let reader = RepositoryReader::new(staged, staged.content());
-    let envelope = async |id| {
-        reader
-            .envelope(id)
-            .await
-            .map_err(|e| format!("read an envelope: {}", chain(&e)))
-    };
-    let before = envelope(current).await?;
-    let after = envelope(remote).await?;
-    write::needed_over(staged, before.state, after.state).await
-}
-
-/// The move's publish key. A mirror has no key of its own to send again: it is the
-/// one forced publish from `current` to `remote`, so its key is derived from them,
-/// and a mirror that lost its answer after the move gets it when made again before
-/// the head moves on.
-fn mirror_key(
-    principal: &Principal,
-    current: RepositoryHead,
-    remote: RepositoryEnvelopeId,
-) -> Result<PublishKey, MirrorFailure> {
-    let request = publish_request_digest(remote, current.generation, current.envelope, true, true);
-    let mut key = [0; 16];
-    key.copy_from_slice(
-        &blake3::Hasher::new_derive_key("wheat-server mirror publish key v1")
-            .update(&request)
-            .finalize()
-            .as_bytes()[..16],
-    );
-    PublishKey::server_write(principal, key, request).map_err(|e| {
-        MirrorFailure::Write(WriteFailure::Invalid(format!(
-            "the principal cannot be bound: {e}"
-        )))
-    })
 }

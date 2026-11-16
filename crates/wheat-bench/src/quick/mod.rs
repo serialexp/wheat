@@ -50,6 +50,7 @@ mod remote_latency;
 mod repository_copy;
 mod revision_merge;
 mod server;
+mod server_restore;
 mod server_stage;
 mod sharded_manifest;
 mod snapshot_export;
@@ -118,6 +119,7 @@ pub const CASES: &[&str] = &[
     state_scan::NAME,
     server_stage::NAME,
     mirror::NAME,
+    server_restore::NAME,
     status_scale::NAME,
     label_move::NAME,
     label_frontiers::NAME,
@@ -295,6 +297,7 @@ pub fn run_case(
         state_scan::NAME => state_scan::run(&context),
         server_stage::NAME => server_stage::run(&context),
         mirror::NAME => mirror::run(&context),
+        server_restore::NAME => server_restore::run(&context),
         status_scale::NAME => status_scale::run(&context),
         label_move::NAME => label_move::run(&context),
         label_frontiers::NAME => label_frontiers::run(&context),

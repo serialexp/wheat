@@ -1,0 +1,30 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261116-140516
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	a671623b6514
+# scale	full
+# scratch_fs	ext4
+# server_restore	{"changes":50,"growth":16,"small_files":10000}
+measurement	value	unit
+server_restore.total.wall	51.067191256	s
+server_restore.total.peak_rss	278933504	bytes
+server_restore.small.objects	3182	count
+server_restore.small.object_bytes	2929717	bytes
+server_restore.small.contents	10050	count
+server_restore.small.restore.wall	0.629054437	s
+server_restore.small.reads	954	count
+server_restore.small.reads_per_object	0.2998114393463231	count
+server_restore.large.objects	101244	count
+server_restore.large.object_bytes	23342697	bytes
+server_restore.large.contents	160050	count
+server_restore.large.restore.wall	14.410456746	s
+server_restore.large.reads	207994	count
+server_restore.large.reads_per_object	2.054383469637707	count
+run.total_time	51.069737243	s
+process.peak_rss	278933504	bytes
+suite.cases	1	count
+suite.case_failures	0	count

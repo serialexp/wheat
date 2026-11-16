@@ -835,26 +835,129 @@ pub async fn restore_snapshot_from<
     publications: &P,
     limits: SnapshotLimits,
 ) -> Result<RepositoryHead, SnapshotError> {
-    validate_limits(limits)?;
-    let (claimed, manifest_bytes) = source.read_manifest().await?;
-    let manifest = SnapshotManifest::decode(&manifest_bytes, limits)?;
-    if manifest.id() != claimed {
-        return Err(SnapshotError::InvalidManifest("authentication failed"));
-    }
+    let manifest = read_snapshot_manifest(source, limits).await?;
     match publications.read() {
         Err(PublicationError::Missing) => {}
         Ok(actual) if actual == manifest.head => {}
         Ok(_) => return Err(SnapshotError::ConflictingAuthority),
         Err(error) => return Err(error.into()),
     }
+    let stores = Stores { objects, content };
+    copy_payload(source, &manifest, &stores, limits).await?;
+    let reader = RepositoryReader::new(objects, content);
+    reader.validate_envelope(manifest.envelope).await?;
+    check_exact_closure(objects, content, &manifest, limits).await?;
+    publications.initialize(manifest.head)?;
+    Ok(manifest.head)
+}
 
+/// Stages the snapshot `source` holds, whose manifest is `manifest` (from
+/// [`read_snapshot_manifest`]), in `stage`, to replace a repository's head with its
+/// envelope: stages every payload the manifest declares, checked against its
+/// inventory, and checks that the envelope's closure is exactly that inventory.
+///
+/// Neither the envelope's validation nor the move of a head is done here: the caller
+/// validates the envelope as [`crate::Arrival::Forced`] over the stage, and moves its
+/// head from wherever it is. Objects go through the stage, which stores them early
+/// once its limits are reached; the stage's caller makes sure nothing collects them
+/// before a head names them.
+pub async fn stage_snapshot_from<S: SnapshotSource, R: crate::RepositoryStore>(
+    source: &S,
+    manifest: &SnapshotManifest,
+    stage: &crate::RepositoryStage<R>,
+    limits: SnapshotLimits,
+) -> Result<(), SnapshotError> {
+    validate_limits(limits)?;
+    manifest.validate(limits)?;
+    copy_payload(source, manifest, stage, limits).await?;
+    check_exact_closure(stage, stage.content(), manifest, limits).await
+}
+
+/// The manifest `source` holds, decoded within `limits` and authenticated against
+/// the id it claims.
+pub async fn read_snapshot_manifest<S: SnapshotSource>(
+    source: &S,
+    limits: SnapshotLimits,
+) -> Result<SnapshotManifest, SnapshotError> {
+    validate_limits(limits)?;
+    let (claimed, manifest_bytes) = source.read_manifest().await?;
+    let manifest = SnapshotManifest::decode(&manifest_bytes, limits)?;
+    if manifest.id() != claimed {
+        return Err(SnapshotError::InvalidManifest("authentication failed"));
+    }
+    Ok(manifest)
+}
+
+/// Where [`copy_payload`] writes a snapshot's payload: stores, or a stage.
+#[async_trait]
+trait PayloadTarget: Send + Sync {
+    async fn put_objects(&self, batch: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError>;
+    /// Stores `batch`, checked against its inventory by [`validate_batch_shape`].
+    async fn put_contents(&self, batch: ContentBatch) -> Result<(), SnapshotError>;
+}
+
+struct Stores<'a, O> {
+    objects: &'a O,
+    content: &'a ContentStore,
+}
+
+#[async_trait]
+impl<O: ImmutableObjectStore> PayloadTarget for Stores<'_, O> {
+    async fn put_objects(&self, batch: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        Ok(self.objects.put_batch(batch, 16).await?)
+    }
+
+    async fn put_contents(&self, batch: ContentBatch) -> Result<(), SnapshotError> {
+        let verified = batch
+            .iter()
+            .map(|(id, bytes)| {
+                VerifiedContent::check(*id, bytes.as_slice())
+                    .map_err(|_| SnapshotError::InventoryMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self.content.put_many(&verified, 16)?)
+    }
+}
+
+#[async_trait]
+impl<R: crate::RepositoryStore> PayloadTarget for crate::RepositoryStage<R> {
+    async fn put_objects(&self, batch: &[(ObjectId, Vec<u8>)]) -> Result<(), SnapshotError> {
+        Ok(self.put_batch(batch, 16).await?)
+    }
+
+    async fn put_contents(&self, batch: ContentBatch) -> Result<(), SnapshotError> {
+        let verified = batch
+            .into_iter()
+            .map(|(id, bytes)| {
+                VerifiedContent::check(id, bytes)
+                    .map(|content| (content, None))
+                    .map_err(|_| SnapshotError::InventoryMismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.put_content(verified)
+            .await
+            .map_err(|error| match error {
+                crate::RepositoryStoreError::Objects(error) => SnapshotError::Object(error),
+                crate::RepositoryStoreError::Content(error) => SnapshotError::Content(error),
+            })
+    }
+}
+
+/// Reads every payload `manifest` declares from `source`, in bounded batches checked
+/// against its inventory, and writes them to `target`.
+async fn copy_payload<S: SnapshotSource, T: PayloadTarget>(
+    source: &S,
+    manifest: &SnapshotManifest,
+    target: &T,
+    limits: SnapshotLimits,
+) -> Result<(), SnapshotError> {
     let mut start = 0;
     while start < manifest.objects.len() {
         let end = inventory_batch_end(&manifest.objects, start, limits)?;
         let inventory = &manifest.objects[start..end];
         let batch = source.read_objects(inventory).await?;
         validate_object_batch(&batch, inventory, limits)?;
-        objects.put_batch(&batch, 16).await?;
+        target.put_objects(&batch).await?;
         start = end;
     }
     start = 0;
@@ -862,18 +965,25 @@ pub async fn restore_snapshot_from<
         let end = inventory_batch_end(&manifest.contents, start, limits)?;
         let inventory = &manifest.contents[start..end];
         let batch = source.read_contents(inventory).await?;
-        let verified = validate_content_batch(&batch, inventory, limits)?;
-        content.put_many(&verified, 16)?;
+        validate_batch_shape(&batch, inventory, limits)?;
+        target.put_contents(batch).await?;
         start = end;
     }
-    let reader = RepositoryReader::new(objects, content);
-    reader.validate_envelope(manifest.envelope).await?;
+    Ok(())
+}
+
+/// Refuses a snapshot whose envelope's closure is not exactly its inventory.
+async fn check_exact_closure<O: ImmutableObjectStore>(
+    objects: &O,
+    content: &ContentStore,
+    manifest: &SnapshotManifest,
+    limits: SnapshotLimits,
+) -> Result<(), SnapshotError> {
     let actual = exact_closure_inventory(objects, content, manifest.envelope, limits).await?;
     if actual.objects != manifest.objects || actual.contents != manifest.contents {
         return Err(SnapshotError::InventoryMismatch);
     }
-    publications.initialize(manifest.head)?;
-    Ok(manifest.head)
+    Ok(())
 }
 
 async fn exact_closure_inventory<O: ImmutableObjectStore>(
@@ -979,21 +1089,6 @@ fn validate_object_batch(
         wheat_core::validate_canonical_object(bytes).map_err(ObjectStoreError::from)?;
     }
     Ok(())
-}
-
-fn validate_content_batch<'b>(
-    batch: &'b [(ContentId, Vec<u8>)],
-    inventory: &[InventoryEntry<ContentId>],
-    limits: SnapshotLimits,
-) -> Result<Vec<VerifiedContent<&'b [u8]>>, SnapshotError> {
-    validate_batch_shape(batch, inventory, limits)?;
-    batch
-        .iter()
-        .map(|(id, bytes)| {
-            VerifiedContent::check(*id, bytes.as_slice())
-                .map_err(|_| SnapshotError::InventoryMismatch)
-        })
-        .collect()
 }
 
 fn inventory_batch_end<I>(

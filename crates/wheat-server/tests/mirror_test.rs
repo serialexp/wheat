@@ -2,84 +2,27 @@
 //! the remote's, fetched incrementally, with the content it relies on named, and
 //! replacing whatever was published to the repository meanwhile.
 
-use crate::support;
-
-use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use async_trait::async_trait;
-use wheat_core::{
-    ChangeId, ChangeMetadata, ChangeProposal, ContentId, Repository, RevisionEdits,
-    RevisionMetadata, Tree, VerifiedContent, ViewId, ViewLabel,
-};
 use wheat_remote::{WheatUrl, parse_wheat_url};
-use wheat_server::access::Principal;
 use wheat_server::mirror::{MirrorFailure, mirror, mirror_over};
-use wheat_server::naming::ContentNaming;
 use wheat_server::network::Network;
 use wheat_server::registry::{Registry, RepositoryEntry};
 use wheat_server::server::{ServerConfig, run_until};
 use wheat_server::write::{
-    ExpectedLabel::{self, Absent, View},
-    LabelChange, ServerWrite, WriteFailure, open_stage, write,
+    ExpectedLabel::{Absent, View},
+    WriteFailure, write,
 };
-use wheat_store::{
-    LocalPublicationStore, MerkleTreeStore, PackedObjectStore, RepositoryHead, RepositoryPublisher,
-    RepositoryReader,
-};
+use wheat_store::RepositoryReader;
 
-use support::edit;
+use crate::support::served::{
+    Repo, change, commit, file, head, id, labels, named_repository as mirror_repository, principal,
+    repository, server_write,
+};
 
 const UPSTREAM: &str = "test/upstream";
-
-/// Records each naming.
-#[derive(Default)]
-struct Recording {
-    calls: Mutex<Vec<Vec<ContentId>>>,
-}
-
-#[async_trait]
-impl ContentNaming for Recording {
-    fn renew_after(&self) -> Duration {
-        Duration::from_secs(3600)
-    }
-
-    async fn named(&self, ids: &[ContentId]) -> io::Result<()> {
-        self.calls.lock().unwrap().push(ids.to_vec());
-        Ok(())
-    }
-}
-
-/// A repository on a packed store, holding only its base view.
-struct Repo {
-    _dir: tempfile::TempDir,
-    objects: PackedObjectStore,
-    base: ViewId,
-}
-
-async fn repository() -> (Repo, LocalPublicationStore) {
-    let dir = tempfile::tempdir().unwrap();
-    let objects = PackedObjectStore::open(dir.path().join("storage")).unwrap();
-    let content = objects.content_store();
-    let heads = LocalPublicationStore::new(dir.path().join("repository.head"));
-    let repo = Repository::new(Tree::new());
-    let base = repo.base_view().id;
-    RepositoryPublisher::new(&objects, &content, &heads)
-        .initialize(&repo)
-        .await
-        .unwrap();
-    (
-        Repo {
-            _dir: dir,
-            objects,
-            base,
-        },
-        heads,
-    )
-}
 
 /// The served remote: its repository, its entry to write to, and its URL.
 struct Upstream {
@@ -116,131 +59,6 @@ async fn upstream_with(config: ServerConfig, scheme: &str) -> Upstream {
         url: parse_wheat_url(&format!("{scheme}://{addr}/{UPSTREAM}")).unwrap(),
         _shutdown: shutdown,
     }
-}
-
-/// The repository mirroring the remote, whose network tells `naming`.
-struct Mirror {
-    repo: Repo,
-    entry: Arc<RepositoryEntry>,
-    naming: Arc<Recording>,
-}
-
-async fn mirror_repository() -> Mirror {
-    let (repo, heads) = repository().await;
-    let naming = Arc::new(Recording::default());
-    let network = Network::with_naming(Box::new(repo.objects.clone()), naming.clone());
-    Mirror {
-        entry: Arc::new(RepositoryEntry::in_network(network, heads)),
-        repo,
-        naming,
-    }
-}
-
-fn principal() -> Principal {
-    Principal {
-        name: "gothab".into(),
-    }
-}
-
-fn id(bytes: &[u8]) -> ContentId {
-    VerifiedContent::new(bytes).id()
-}
-
-fn change(name: &str, expected: ExpectedLabel, new: ViewId) -> LabelChange {
-    LabelChange {
-        name: name.to_owned(),
-        expected,
-        new: Some(ViewLabel::from(new)),
-    }
-}
-
-fn server_write(key: u8, labels: Vec<LabelChange>) -> ServerWrite {
-    ServerWrite {
-        principal: principal(),
-        key: [key; 16],
-        labels,
-        force_labels: false,
-    }
-}
-
-fn proposal(edits: RevisionEdits) -> ChangeProposal {
-    ChangeProposal {
-        id: ChangeId::new(),
-        metadata: ChangeMetadata::default(),
-        dependencies: BTreeSet::new(),
-        revision_metadata: RevisionMetadata::default(),
-        edits,
-    }
-}
-
-/// Publishes to `entry` a change writing `path` on `view`, moving `main` from
-/// `expected` to it; answers its view.
-async fn commit(
-    entry: &Arc<RepositoryEntry>,
-    key: u8,
-    view: ViewId,
-    expected: ExpectedLabel,
-    path: &'static str,
-    value: &'static [u8],
-) -> ViewId {
-    let stage = open_stage(entry).await.unwrap();
-    let edited = stage
-        .build(move |builder| async move {
-            builder.content().put(value).unwrap();
-            let mutator = builder.mutator();
-            let (prepared, outcome) = mutator
-                .create_on_frontier(builder.head(), view, view, proposal(edit(path, value)))
-                .await
-                .unwrap();
-            mutator.publish(prepared).await.unwrap();
-            outcome.resulting_view
-        })
-        .await
-        .unwrap();
-    stage
-        .submit(
-            server_write(key, vec![change("main", expected, edited)]),
-            [key; 32],
-        )
-        .await
-        .unwrap();
-    edited
-}
-
-async fn head(entry: &RepositoryEntry) -> RepositoryHead {
-    entry.heads.head().await.unwrap()
-}
-
-/// The labels `head` holds in `repo`, by name.
-async fn labels(repo: &Repo, head: RepositoryHead) -> Vec<(String, ViewId)> {
-    let content = repo.objects.content_store();
-    let reader = RepositoryReader::new(&repo.objects, &content);
-    let envelope = reader.envelope(head.envelope).await.unwrap();
-    reader
-        .view_label_manifest(envelope.labels)
-        .await
-        .unwrap()
-        .labels
-        .into_iter()
-        .map(|(name, label)| (name, label.view))
-        .collect()
-}
-
-/// What `view` holds at `path` in `repo`, read back whole.
-async fn file(repo: &Repo, view: ViewId, path: &str) -> Option<Vec<u8>> {
-    let content = repo.objects.content_store();
-    let tree = RepositoryReader::new(&repo.objects, &content)
-        .view(view)
-        .await
-        .unwrap()
-        .tree;
-    let value = MerkleTreeStore::new(&repo.objects)
-        .lookup_many(tree, &[path])
-        .await
-        .unwrap()
-        .pop()
-        .unwrap()?;
-    Some(content.get(value.content).unwrap())
 }
 
 #[tokio::test]

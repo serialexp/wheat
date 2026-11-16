@@ -118,7 +118,8 @@ mod structure_gc;
 pub use snapshot::{
     ContentBatch, InventoryEntry, MemorySnapshotSink, NativeSnapshot, ObjectBatch, SnapshotError,
     SnapshotId, SnapshotLimits, SnapshotManifest, SnapshotSink, SnapshotSource, export_snapshot,
-    export_snapshot_to, restore_snapshot, restore_snapshot_from,
+    export_snapshot_to, read_snapshot_manifest, restore_snapshot, restore_snapshot_from,
+    stage_snapshot_from,
 };
 pub use structure_gc::{
     CollectableStructure, Counts, ObjectMarks, PinnedObjects, StorePin, StoredInventory,

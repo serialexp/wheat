@@ -32,6 +32,8 @@ pub mod publish;
 pub mod quiesce;
 pub mod receipt;
 pub mod registry;
+mod replace;
+pub mod restore;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;

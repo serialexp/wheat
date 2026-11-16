@@ -68,8 +68,8 @@ pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     Ok(recorder.finish())
 }
 
-/// The counting store, shared with the mirror's network.
-struct Shared(Arc<Counting>);
+/// The counting store, shared with a served repository's network.
+pub(crate) struct Shared(pub(crate) Arc<Counting>);
 
 #[async_trait]
 impl ImmutableObjectStore for Shared {
@@ -104,7 +104,7 @@ impl ImmutableObjectStore for Shared {
 
 /// A network told what publishes rely on, as Gothab's is, that stamps nothing: the
 /// naming's reads are counted, not its stamps.
-struct Unstamped;
+pub(crate) struct Unstamped;
 
 #[async_trait]
 impl ContentNaming for Unstamped {

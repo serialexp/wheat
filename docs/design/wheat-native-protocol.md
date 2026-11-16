@@ -2,7 +2,7 @@
 
 Status: partial — Phase 0 complete, Phase 1 standalone server + CLI client + e2e tests + packed segments complete, remaining Phase 1–2 outstanding
 Owner: bart
-Last updated: 2026-11-13
+Last updated: 2026-11-16
 
 ## Implementation status
 
@@ -1270,6 +1270,22 @@ TLS over it for `wheat+tls://`, checking the certificate against the URL's host 
 rather than the address connected to, and the rest of the session, through
 `wheat_remote::open_over(stream, url, token)`, which takes any connected
 `AsyncRead + AsyncWrite` stream. `mirror` and `open` connect as before.
+
+Gothab restores a served repository to one of its snapshots with
+`wheat_server::restore::restore_from(entry, principal, source, limits)` (2026-11-16,
+walrus). `restore_snapshot_from` cannot do it: it only initializes an empty
+publication, and moving the head from outside would go behind the group commit's
+back. A restore is a mirror whose source is a `SnapshotSource`, and shares the move
+with it (`replace.rs`): a writer slot from before the head is read until it has
+moved, naming over the current head, and the forced commit with validation already
+done, under a publish key derived from the move with its own context. The manifest is
+authenticated against the id the source claims (`read_snapshot_manifest`), so that
+claim should come from the host's own record of the snapshot. `stage_snapshot_from`
+stages the payload in bounded batches checked against the inventory, and checks that
+the envelope's closure is exactly the inventory. The envelope is then validated whole
+(`Arrival::Forced`). A restore to the envelope the head is at stages nothing. Bench
+case `server_restore`: restoring 101,244 objects (160,000 files) into an empty
+repository reads 2.05 objects of its store per snapshot object, against a budget of 4.
 
 To back a repository up or move it, Gothab holds it still with
 `Registry::quiesce(name)` and copies its files. A quiesced repository refuses new
