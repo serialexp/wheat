@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_store::{
     CollectableStructure, ContentItem, ContentStore, ImmutableObjectStore, ObjectStoreError,
-    RepositoryStore, RepositoryStoreError, SnapshotError, SnapshotLimits, StoredInventory,
-    StoredObject, StoredWrite, StructureCollection, StructureCollectionError, StructureReport,
-    analyze_structure, collect_structure,
+    PoolHeads, RepositoryStore, RepositoryStoreError, SnapshotError, SnapshotLimits,
+    StoredInventory, StoredObject, StoredWrite, StructureCollection, StructureCollectionError,
+    StructureReport, ValidatedHeads, analyze_structure, collect_structure, validate_heads,
 };
 
 use crate::naming::ContentNaming;
@@ -45,19 +45,37 @@ impl Network {
 }
 
 impl Network {
+    /// Validates `heads`, the head of every repository of the network, named or not,
+    /// each under its repository: the first step of pool GC (see
+    /// [`wheat_store::validate_heads`]), which needs no hold, so publishes go on while
+    /// it runs. Runs on a thread for blocking work.
+    pub async fn validate_heads<K: Ord + Send + Sync + 'static>(
+        &self,
+        heads: PoolHeads<K>,
+    ) -> Result<ValidatedHeads<K>, NetworkCollectionError> {
+        let network = self.clone();
+        crate::blocking::drive(move || async move { validate_heads(&network.store, heads).await })
+            .await
+            .map_err(NetworkCollectionError::Stopped)?
+            .map_err(NetworkCollectionError::Collection)
+    }
+
     /// Removes from the network's store every object none of `heads` reaches: pool GC
-    /// (see [`wheat_store::collect_structure`]). `heads` is the head of every
-    /// repository of the network, named or not, read while `held` holds it.
+    /// (see [`wheat_store::collect_structure`]). `validated` is what
+    /// [`Self::validate_heads`] validated before the hold; `heads` is the head of
+    /// every repository of the network, named or not, read again while `held` holds
+    /// it. Only what the heads gained since `validated` is validated here.
     ///
     /// `held` is a hold on a repository of this network ([`Registry::quiesce`](crate::registry::Registry::quiesce) or
     /// [`Quiesced::hold`]), kept from before the heads were read: a publish's objects
     /// are stored before a head names them, so one let in meanwhile could lose them.
     /// Fetches go on, reading the store as it was when they began. Runs on a thread for
     /// blocking work.
-    pub async fn collect_structure(
+    pub async fn collect_structure<K: Ord + Send + Sync + 'static>(
         &self,
         held: &Quiesced,
-        heads: Vec<RepositoryEnvelopeId>,
+        validated: ValidatedHeads<K>,
+        heads: PoolHeads<K>,
         limits: SnapshotLimits,
     ) -> Result<StructureCollection, NetworkCollectionError> {
         if !std::ptr::eq::<NetworkStores>(&*held.entry().network, &**self) {
@@ -65,7 +83,7 @@ impl Network {
         }
         let network = self.clone();
         crate::blocking::drive(move || async move {
-            collect_structure(&network.store, &heads, limits).await
+            collect_structure(&network.store, &validated, &heads, limits).await
         })
         .await
         .map_err(NetworkCollectionError::Stopped)?

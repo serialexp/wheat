@@ -8,11 +8,16 @@
 //!   lists what the store holds, and counts what no head reaches, by kind. It deletes
 //!   nothing, and so needs no hold on the network: a publish while it runs can leave
 //!   its new objects counted as unreachable, since the walk read the heads before it.
-//! - [`collect_structure`] validates each head completely, marks what they reach and
-//!   removes the rest, with the network's writers held (Bart, 2026-11-12). Readers
-//!   that began before it go on reading what it removed through a [`StorePin`].
+//! - [`validate_heads`] validates each head completely (Bart, 2026-11-12), with
+//!   publishes going on. [`collect_structure`] then runs with the network's writers
+//!   held: it validates only what the heads gained since, marks what they reach and
+//!   removes the rest. Readers that began before it go on reading what it removed
+//!   through a [`StorePin`].
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use rusqlite::params;
@@ -20,9 +25,9 @@ use thiserror::Error;
 use wheat_core::{ContentId, ObjectId, RepositoryEnvelopeId};
 
 use crate::{
-    ImmutableObjectStore, ObjectKind, ObjectStoreError, RepositoryPublicationError,
-    RepositoryReader, RepositoryStore, SnapshotError, SnapshotLimits, StoredObject,
-    snapshot::ClosureWalk,
+    ImmutableObjectStore, IncrementBudget, ObjectKind, ObjectStoreError,
+    RepositoryPublicationError, RepositoryReader, RepositoryStore, SnapshotError, SnapshotLimits,
+    StoredObject, snapshot::ClosureWalk,
 };
 
 /// A record a store holds, as its inventory lists it.
@@ -369,8 +374,15 @@ pub enum StructureCollectionError {
 /// What [`collect_structure`] did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StructureCollection {
-    /// The heads validated and walked.
+    /// The heads walked.
     pub roots: usize,
+    /// Heads that moved after [`validate_heads`], so that only what they gained was
+    /// validated, with the writers held.
+    pub extended: usize,
+    /// Heads validated completely with the writers held: a repository
+    /// [`validate_heads`] did not see, or a head moved to one that does not extend
+    /// the one validated (a restore, a forced mirror).
+    pub revalidated: usize,
     /// The objects they reach.
     pub marked: u64,
     pub sweep: SweepReport,
@@ -381,8 +393,9 @@ impl std::fmt::Display for StructureCollection {
         let sweep = &self.sweep;
         writeln!(
             out,
-            "{} heads validated, reaching {} objects",
-            self.roots, self.marked
+            "{} heads, reaching {} objects; with publishes held, {} moved heads validated \
+             for what they gained and {} validated whole",
+            self.roots, self.marked, self.extended, self.revalidated
         )?;
         writeln!(
             out,
@@ -409,43 +422,126 @@ impl std::fmt::Display for StructureCollection {
     }
 }
 
-/// Removes from `store` every object none of `roots`, the heads of every
-/// repository sharing the store, reaches.
+/// The heads of the repositories sharing a pool, each under the repository whose head
+/// it is: [`collect_structure`] pairs a head with the one [`validate_heads`] validated
+/// for the same repository.
+pub type PoolHeads<K> = BTreeMap<K, RepositoryEnvelopeId>;
+
+/// Heads [`validate_heads`] validated completely, for [`collect_structure`].
+#[derive(Clone, Debug)]
+pub struct ValidatedHeads<K> {
+    heads: PoolHeads<K>,
+    envelopes: BTreeSet<RepositoryEnvelopeId>,
+}
+
+impl<K> ValidatedHeads<K> {
+    /// How many distinct envelopes were validated: repositories at the same envelope
+    /// share one validation.
+    #[must_use]
+    pub fn validated(&self) -> usize {
+        self.envelopes.len()
+    }
+}
+
+/// Validates each of `heads`, the head of every repository sharing `store`,
+/// completely ([`RepositoryReader::validate_envelope`]), once per distinct envelope:
+/// the first step of pool GC, before [`collect_structure`].
 ///
-/// Fails closed, removing nothing, when a head does not validate completely
-/// ([`RepositoryReader::validate_envelope`]) or cannot be walked to the end. The
-/// caller holds every writer of the store from before this is called until it
-/// returns (in a server, wheat-server's `Registry::quiesce`); fetches may go on, reading through
-/// a [`CollectableStructure::pin`] taken when they began.
-///
-/// Reads each head's closure to validate it and once more to mark it, with the
-/// marks on disk; writes the kept objects once.
-#[tracing::instrument(level = "debug", skip_all, fields(roots = roots.len()))]
-pub async fn collect_structure<S: RepositoryStore>(
+/// Needs no hold: publishes may go on, and [`collect_structure`] validates what the
+/// heads gained meanwhile. Fails, with nothing removed, on a store that cannot
+/// collect, on no heads, or on a head that does not validate.
+#[tracing::instrument(level = "debug", skip_all, fields(heads = heads.len()))]
+pub async fn validate_heads<S: RepositoryStore, K: Ord>(
     store: &S,
-    roots: &[RepositoryEnvelopeId],
+    heads: PoolHeads<K>,
+) -> Result<ValidatedHeads<K>, StructureCollectionError> {
+    store
+        .collectable_structure()
+        .ok_or(StructureCollectionError::Unsupported)?;
+    if heads.is_empty() {
+        return Err(StructureCollectionError::NoHeads);
+    }
+    let content = store.content_store();
+    let reader = RepositoryReader::new(store, &content);
+    let mut envelopes = BTreeSet::new();
+    for &head in heads.values() {
+        if envelopes.insert(head) {
+            reader
+                .validate_envelope(head)
+                .await
+                .map_err(|source| StructureCollectionError::Invalid { head, source })?;
+        }
+    }
+    Ok(ValidatedHeads { heads, envelopes })
+}
+
+/// Removes from `store` every object none of `heads`, the head of every repository
+/// sharing the store, reaches. `validated` is what [`validate_heads`] validated of
+/// the same store, before the hold.
+///
+/// The caller holds every writer of the store from before `heads` are read until
+/// this returns (in a server, wheat-server's `Registry::quiesce`); fetches may go on,
+/// reading through a [`CollectableStructure::pin`] taken when they began.
+///
+/// Every head is valid before anything is marked. A head `validated` holds needs
+/// nothing more; one whose repository's head was validated and has moved on since is
+/// validated for what it gained ([`RepositoryReader::validate_increment`]), and
+/// completely when that fails (a move that does not extend it) or its repository
+/// is new. Fails closed, removing nothing, when a head does not validate or cannot be
+/// walked to the end.
+///
+/// With the writers held it reads what the heads gained, then each head's closure
+/// once to mark it, with the marks on disk, and writes the kept objects once.
+#[tracing::instrument(level = "debug", skip_all, fields(roots = heads.len()))]
+pub async fn collect_structure<S: RepositoryStore, K: Ord>(
+    store: &S,
+    validated: &ValidatedHeads<K>,
+    heads: &PoolHeads<K>,
     limits: SnapshotLimits,
 ) -> Result<StructureCollection, StructureCollectionError> {
     let collector = store
         .collectable_structure()
         .ok_or(StructureCollectionError::Unsupported)?;
-    if roots.is_empty() {
+    if heads.is_empty() {
         return Err(StructureCollectionError::NoHeads);
     }
     let content = store.content_store();
     let reader = RepositoryReader::new(store, &content);
-    for head in roots {
-        reader.validate_envelope(*head).await.map_err(|source| {
-            StructureCollectionError::Invalid {
-                head: *head,
-                source,
-            }
-        })?;
+    let mut valid = BTreeSet::new();
+    let (mut extended, mut revalidated) = (0, 0);
+    for (repository, &head) in heads {
+        if validated.envelopes.contains(&head) || !valid.insert(head) {
+            continue;
+        }
+        let extends = match validated.heads.get(repository) {
+            Some(&old) => reader
+                .validate_increment(old, head, IncrementBudget::STANDARD)
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if extends {
+            extended += 1;
+            continue;
+        }
+        reader
+            .validate_envelope(head)
+            .await
+            .map_err(|source| StructureCollectionError::Invalid { head, source })?;
+        revalidated += 1;
     }
-    let marks = ObjectMarks::new(walk_heads(store, roots, limits).await?)?;
+    let roots: Vec<RepositoryEnvelopeId> = heads
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let marks = ObjectMarks::new(walk_heads(store, &roots, limits).await?)?;
     let sweep = collector.sweep(&marks)?;
     Ok(StructureCollection {
-        roots: roots.len(),
+        roots: heads.len(),
+        extended,
+        revalidated,
         marked: marks.marked(),
         sweep,
     })

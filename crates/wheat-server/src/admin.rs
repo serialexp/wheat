@@ -405,7 +405,10 @@ async fn gc_dry_run(
         .ok_or_else(|| format!("there is no repository {repository}"))?;
 
     phase("reading the heads");
-    let heads = network_heads(directory, located.network).await?;
+    let heads: Vec<_> = network_heads(directory, located.network)
+        .await?
+        .into_values()
+        .collect();
 
     phase("walking the heads");
     let report = entry
@@ -420,9 +423,10 @@ async fn gc_dry_run(
     ))
 }
 
-/// Removes what the network of `repository` holds that no head of it reaches. Holds
-/// the network's publishes from before the heads are read until the sweep is done;
-/// fetches go on, reading what they began with.
+/// Removes what the network of `repository` holds that no head of it reaches. Validates
+/// each head with publishes going on, then holds the network's publishes from before
+/// the heads are read again until the sweep is done, validating only what they gained
+/// meanwhile; fetches go on, reading what they began with.
 async fn gc(
     registry: &Arc<Registry>,
     directory: &DirectoryHandle,
@@ -430,13 +434,27 @@ async fn gc(
     phase: &(dyn Fn(&str) + Sync),
 ) -> Result<String, String> {
     let located = locate(directory, repository).await?;
+    // The entry keeps the network's store open for as long as it is held.
+    let entry = registry
+        .get(repository)
+        .await
+        .map_err(|error| chain(&error))?
+        .ok_or_else(|| format!("there is no repository {repository}"))?;
+
+    phase("validating each head");
+    let heads = network_heads(directory, located.network).await?;
+    let validated = entry
+        .network
+        .validate_heads(heads)
+        .await
+        .map_err(|error| chain(&error))?;
 
     phase("holding the network still");
     let held = quiesce(registry, repository).await?;
-    phase("reading the heads");
+    phase("reading the heads again");
     let heads = network_heads(directory, located.network).await?;
     // Publishes refused meanwhile are told how long the collection should take: a
-    // read of the network's files for each head's validation and for the marking.
+    // read of the network's files for the marking and one for the sweep.
     let sized = {
         let network = directory.repositories.network(located.network);
         spawn_blocking(move || network.files())
@@ -445,14 +463,13 @@ async fn gc(
     };
     if let Ok(files) = sized {
         let bytes: u64 = files.iter().map(|file| file.len).sum();
-        let reads = u64::try_from(heads.len() + 1).unwrap_or(u64::MAX);
-        held.expect(copy_estimate(bytes.saturating_mul(reads)));
+        held.expect(copy_estimate(bytes.saturating_mul(2)));
     }
 
-    phase("validating each head, marking and sweeping");
+    phase("validating what the heads gained, marking and sweeping");
     let network = held.entry().network.clone();
     let collection = network
-        .collect_structure(&held, heads, SnapshotLimits::default())
+        .collect_structure(&held, validated, heads, SnapshotLimits::default())
         .await
         .map_err(|error| chain(&error))?;
     drop(held);
@@ -495,7 +512,7 @@ async fn quiesce(
 async fn network_heads(
     directory: &DirectoryHandle,
     network: Uuid,
-) -> Result<Vec<wheat_core::RepositoryEnvelopeId>, String> {
+) -> Result<wheat_store::PoolHeads<Uuid>, String> {
     let network = directory.repositories.network(network);
     spawn_blocking(move || {
         network
@@ -505,10 +522,10 @@ async fn network_heads(
                 network
                     .publications(id)
                     .read()
-                    .map(|head| head.envelope)
+                    .map(|head| (id, head.envelope))
                     .map_err(|error| std::io::Error::other(error.to_string()))
             })
-            .collect::<std::io::Result<Vec<_>>>()
+            .collect::<std::io::Result<wheat_store::PoolHeads<Uuid>>>()
     })
     .await
     .map_err(|error| chain(&error))?

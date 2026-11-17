@@ -1,0 +1,32 @@
+# wheat-bench results v1
+# profile	wheat-quick
+# stamp	20261117-172332
+# cores	24
+# cpu	AMD Ryzen 9 9900X 12-Core Processor
+# dirty	true
+# release	true
+# rev	52db93220e6d
+# scale	full
+# scratch_fs	ext4
+# structure_gc	{"changes":10000,"files":1000,"forks":20}
+measurement	value	unit
+structure_gc.total.wall	370.309082177	s
+structure_gc.total.peak_rss	423710720	bytes
+structure_gc.n10000.analyze.wall	6.374095931	s
+structure_gc.n10000.analyze.reads	191007	count
+structure_gc.n10000.reachable.objects	191007	count
+structure_gc.n10000.unreachable.objects	156847	count
+structure_gc.n10000.unreachable.share_of_bytes	68.29999222609258	percent
+structure_gc.n10000.validate_one.wall	15.460640477	s
+structure_gc.n10000.validate_one.reads	280989	count
+structure_gc.n10000.validate_heads.wall	311.774393038	s
+structure_gc.n10000.validate_heads.reads	5900600	count
+structure_gc.n10000.collect.wall	9.690557044	s
+structure_gc.n10000.collect.reads	191007	count
+structure_gc.n10000.collect.bytes_written	271517025	bytes
+structure_gc.n10000.collect.written_per_kept_byte	1.0064709839320625	count
+structure_gc.n10000.collect.bytes_removed	577970917	bytes
+run.total_time	370.311151481	s
+process.peak_rss	423710720	bytes
+suite.cases	1	count
+suite.case_failures	0	count

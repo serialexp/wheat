@@ -422,7 +422,11 @@ fn gc_removes_what_publishes_left_unreachable() {
 
     let collected = ok_json(root.path(), &stores, &config, &gc);
     let message = collected["message"].as_str().unwrap();
-    assert!(message.contains("1 heads validated"), "{message}");
+    assert!(message.contains("1 heads, reaching"), "{message}");
+    assert!(
+        message.contains("0 moved heads validated for what they gained and 0 validated whole"),
+        "nothing moved, so nothing was validated with publishes held: {message}"
+    );
     assert!(!message.contains(", 0 objects ("), "{message}");
     let after = ok_json(
         root.path(),

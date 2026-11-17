@@ -12,11 +12,15 @@
 //!   reachable count however much garbage the pool holds (the budget);
 //! - the listing reads no objects at all.
 //!
-//! The collection validates each head, walks them again to mark, and rewrites the
-//! pool keeping what is marked. Its budgets:
+//! The collection validates each head with publishes going on, then holds them while
+//! it walks the heads again to mark and rewrites the pool keeping what is marked. Its
+//! budgets:
 //!
-//! - objects read stay within one complete validation per head (measured on its
-//!   own, of the largest head) plus the marking walk, however much garbage there is;
+//! - objects read validating stay within one complete validation per head (measured
+//!   on its own, of the largest head);
+//! - with publishes held, and no head moved meanwhile, objects read stay within the
+//!   marking walk, one read per reachable object, however many heads there are: the
+//!   hold does not grow with heads × history;
 //! - the segments written hold the reachable objects and nothing else: their bytes
 //!   stay within [`WRITTEN_PER_KEPT_BYTE`] of those objects' canonical bytes.
 
@@ -28,8 +32,9 @@ use wheat_core::{ObjectId, RepositoryEnvelopeId};
 use wheat_store::{
     CollectableStructure, ContentItem, ContentStore, Durability, ImmutableObjectStore,
     LocalPublicationStore, ObjectStoreError, PackedObjectStore, PersistedRepositoryMutator,
-    PublicationStore, RepositoryReader, RepositoryStore, RepositoryStoreError, SnapshotLimits,
-    StoredObject, StoredWrite, analyze_structure, collect_structure,
+    PoolHeads, PublicationStore, RepositoryReader, RepositoryStore, RepositoryStoreError,
+    SnapshotLimits, StoredObject, StoredWrite, analyze_structure, collect_structure,
+    validate_heads,
 };
 
 use super::{
@@ -150,12 +155,38 @@ async fn measure(root: &Path, changes: usize, recorder: &mut Recorder) -> Result
         "count",
     );
 
+    let heads: PoolHeads<usize> = roots.iter().copied().enumerate().collect();
     let started = Instant::now();
-    let collection = collect_structure(&objects, &roots, SnapshotLimits::default())
+    let validated = validate_heads(&objects, heads.clone())
+        .await
+        .context("validating the heads")?;
+    recorder.wall(
+        &format!("{step}.validate_heads"),
+        started.elapsed().as_secs_f64(),
+    );
+    let (validate_heads_reads, _) = objects.objects.take();
+    recorder.value(
+        &format!("{step}.validate_heads.reads"),
+        validate_heads_reads as f64,
+        "count",
+    );
+    recorder.at_most(
+        &format!("{step}.validate_heads.reads"),
+        (roots.len() as u64 * validate_reads) as f64,
+        "count",
+    );
+
+    // The hold: from here until the sweep is done.
+    let started = Instant::now();
+    let collection = collect_structure(&objects, &validated, &heads, SnapshotLimits::default())
         .await
         .context("collecting the pool")?;
     recorder.wall(&format!("{step}.collect"), started.elapsed().as_secs_f64());
     let (reads, _) = objects.objects.take();
+    ensure!(
+        collection.extended == 0 && collection.revalidated == 0,
+        "no head moved, yet some were validated in the hold: {collection:?}"
+    );
     let sweep = collection.sweep;
     ensure!(
         sweep.objects_dropped + sweep.loose_objects_retired == unreachable.records
@@ -192,10 +223,10 @@ async fn measure(root: &Path, changes: usize, recorder: &mut Recorder) -> Result
             .saturating_sub(sweep.segment_bytes_after) as f64,
         "bytes",
     );
-    // A complete validation of each head, then the marking walk.
+    // The marking walk alone.
     recorder.at_most(
         &format!("{step}.collect.reads"),
-        (roots.len() as u64 * validate_reads + reachable.records) as f64,
+        reachable.records as f64,
         "count",
     );
     recorder.at_most(

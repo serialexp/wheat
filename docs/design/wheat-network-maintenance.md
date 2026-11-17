@@ -9,7 +9,7 @@ two gaps recorded below. Bart answered questions 1–5 on 2026-10-27; a
 review by Codex and Antigravity the same day raised questions 6–8, which Bart
 answered on 2026-10-28, and the changes in [Review](#review-2026-10-27).
 Owner: bart
-Last updated: 2026-11-13
+Last updated: 2026-11-18
 
 ## Implementation status
 
@@ -72,8 +72,9 @@ and move them from Outstanding to Done.
   while a sweep is publishing waits for the epoch's retired store rather than finding
   nothing. Opening a store removes `retired/` and the segment files no catalog names, so
   a crash leaves nothing behind; a store copy skips `retired/` (`packed/files.rs`).
-  wheat-server's fetch pins when it begins (`fetch.rs`). The embedder's call is
-  `Network::collect_structure(&Quiesced, heads, limits)`, refused with `NotHeld` for a
+  wheat-server's fetch pins when it begins (`fetch.rs`). The embedder's call was
+  `Network::collect_structure(&Quiesced, heads, limits)` (now in two steps: see the
+  decision below), refused with `NotHeld` for a
   hold on another network, run on a blocking thread; `wheat admin gc <repository>`
   (without `--dry-run`) quiesces the network, reads every head file of it, sets the
   retry estimate to a read of the network's files per head plus one, and collects.
@@ -92,6 +93,27 @@ and move them from Outstanding to Done.
   closed and opened again loses the retired loose files; a file copy of the store while
   a pin drops can miss a removed file (`retired/` is skipped, a replaced segment is not
   named by the catalog the copy reads).
+- [x] **Decision — pool GC validates before its hold (2026-11-18).** The hold was
+  400 s at 10,000 changes plus 20 forks, 335 s of it the 21 complete validations,
+  growing with heads × history. Options: keep it; validate before the hold and only
+  what the heads gained in it; or two short holds with a write barrier, as content GC
+  does. Bart chose the second. `validate_heads` validates each distinct head
+  envelope completely with publishes going on, keyed by repository (`PoolHeads<K>`);
+  `collect_structure(store, &validated, &heads, limits)`, with the writers held,
+  re-reads the heads, takes a head `validate_heads` validated as it is, validates a
+  head that moved on from its repository's validated one for what it gained
+  (`validate_increment`), and validates whole a head of a new repository or one that
+  does not extend the validated one (a restore, a forced mirror); then marks and
+  sweeps as before. `StructureCollection` counts the two kinds (`extended`,
+  `revalidated`). wheat-server: `Network::validate_heads(heads)` and
+  `Network::collect_structure(&Quiesced, validated, heads, limits)`; `wheat admin gc`
+  validates, then quiesces, reads the heads again and collects, with the retry
+  estimate a read of the network's files for the marking and one for the sweep.
+  Tests in `wheat-store/tests/structure_gc.rs` (a moved head, a head gone back, a new
+  repository, a head that does not validate in the hold). Bench case `structure_gc`
+  (release, 2026-11-17): validating takes 312 s and 5,900,600 reads before the hold
+  (budget 21 complete validations); the hold is 9.7 s and 191,007 reads, the marking
+  walk alone (budget: one read per reachable object), however many heads there are.
 - [x] **Decision — a move refuses writes (2026-10-28).** Open question 6: from
   export until the source is deleted the network refuses publishes with a retryable
   error carrying a retry delay from the move's expected duration.
@@ -183,11 +205,6 @@ and move them from Outstanding to Done.
   content only from before it joined a directory: an adopted standalone repository's
   copy keeps its records (`adopt_repository`). Dropping them needs the content store
   checked to hold each record first.
-- [ ] **Question — how long pool GC holds publishes.** Validating every head under the
-  hold is most of it: 335 of 400 s at 10,000 changes plus 20 forks, growing with
-  heads × history. Bart chose validating each head (2026-11-12); whether some of it may
-  run before the hold (validate, then hold and re-read the heads, validating only those
-  that moved) is his call.
 - [ ] **Phase 5 — content GC.** Across the directory: mark every head's
   `required_content` plus delta bases, rebuild the content store keeping only marked
   records.

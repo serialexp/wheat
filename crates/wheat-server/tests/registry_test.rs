@@ -245,13 +245,16 @@ async fn a_collection_needs_a_hold_on_its_own_network() {
     create(repos.path(), "carol/other").await;
     let registry = Registry::from_repos_dir(repos.path(), RegistryLimits::default()).unwrap();
     let alice = registry.get("alice/repo").await.unwrap().unwrap();
+    let heads = wheat_store::PoolHeads::from([(0, head.envelope)]);
+    let validated = alice.network.validate_heads(heads.clone()).await.unwrap();
 
     let other = registry.quiesce("carol/other").await.unwrap().unwrap();
     let refused = alice
         .network
         .collect_structure(
             &other,
-            vec![head.envelope],
+            validated.clone(),
+            heads.clone(),
             wheat_store::SnapshotLimits::default(),
         )
         .await;
@@ -269,12 +272,18 @@ async fn a_collection_needs_a_hold_on_its_own_network() {
         .network
         .collect_structure(
             &held,
-            vec![head.envelope],
+            validated,
+            heads,
             wheat_store::SnapshotLimits::default(),
         )
         .await
         .unwrap();
     assert_eq!(collection.roots, 1);
+    assert_eq!(
+        (collection.extended, collection.revalidated),
+        (0, 0),
+        "validated before the hold"
+    );
     drop(held);
     assert_eq!(alice.heads.head().await.unwrap(), head);
 }

@@ -9,10 +9,22 @@ use crate::support;
 use wheat_core::{ApplicationContext, ObjectId, Repository, RepositoryEnvelopeId, Tree};
 use wheat_store::{
     CollectableStructure, ContentStore, ImmutableObjectStore, LocalPublicationStore,
-    ObjectStoreError, PackedObjectStore, PinnedObjects, RepositoryPublisher, RepositoryReader,
-    RepositoryStore, SnapshotLimits, StoredInventory, StoredRecord, StructureCollectionError,
-    analyze_structure, collect_structure,
+    ObjectStoreError, PackedObjectStore, PinnedObjects, PoolHeads, RepositoryPublisher,
+    RepositoryReader, RepositoryStore, SnapshotLimits, StoredInventory, StoredRecord,
+    StructureCollection, StructureCollectionError, analyze_structure, collect_structure,
+    validate_heads,
 };
+
+/// Pool GC as a server runs it, with no head moving between its two steps: `heads`
+/// validated, then collected.
+async fn collect<S: RepositoryStore>(
+    store: &S,
+    heads: &[RepositoryEnvelopeId],
+) -> Result<StructureCollection, StructureCollectionError> {
+    let heads: PoolHeads<usize> = heads.iter().copied().enumerate().collect();
+    let validated = validate_heads(store, heads.clone()).await?;
+    collect_structure(store, &validated, &heads, SnapshotLimits::default()).await
+}
 
 async fn pool() -> (
     tempfile::TempDir,
@@ -174,9 +186,7 @@ async fn a_collection_removes_what_no_head_reaches() {
         objects.clone(),
         wheat_store::SeparateRepositoryStore::new(objects.clone(), content.clone()),
     );
-    let collection = collect_structure(&store, &[second], SnapshotLimits::default())
-        .await
-        .unwrap();
+    let collection = collect(&store, &[second]).await.unwrap();
     assert_eq!(collection.roots, 1);
     assert_eq!(collection.marked, before.total_reachable().records);
     assert_eq!(
@@ -234,9 +244,7 @@ async fn a_pin_reads_what_a_later_sweep_removed_until_it_is_dropped() {
     let unpinned_before = objects.pin();
     drop(unpinned_before);
 
-    let collection = collect_structure(&store, &[second], SnapshotLimits::default())
-        .await
-        .unwrap();
+    let collection = collect(&store, &[second]).await.unwrap();
     let pinned = PinnedObjects::new(&objects, Some(pin));
     let envelope = pinned.get(ObjectId::from(first)).await.unwrap();
     assert_eq!(envelope.id, ObjectId::from(first));
@@ -269,9 +277,7 @@ async fn a_sweep_retires_loose_objects_and_keeps_the_pools_content() {
     let loose_before = count_files(&loose);
     let pin = objects.pin();
 
-    let collection = collect_structure(&objects, &[second], SnapshotLimits::default())
-        .await
-        .unwrap();
+    let collection = collect(&objects, &[second]).await.unwrap();
     assert!(collection.sweep.loose_objects_retired >= 2);
     assert!(collection.sweep.loose_object_bytes_retired > 0);
     assert_eq!(
@@ -313,29 +319,121 @@ async fn a_collection_fails_closed() {
         wheat_store::SeparateRepositoryStore::new(objects.clone(), content.clone()),
     );
     assert!(matches!(
-        collect_structure(&store, &[], SnapshotLimits::default()).await,
+        collect(&store, &[]).await,
         Err(StructureCollectionError::NoHeads)
     ));
     let absent = RepositoryEnvelopeId::from_digest([7; 32]);
     assert!(matches!(
-        collect_structure(&store, &[second, absent], SnapshotLimits::default()).await,
+        collect(&store, &[second, absent]).await,
         Err(StructureCollectionError::Invalid { head, .. }) if head == absent
     ));
     // A store whose content is not the repository's cannot validate a head that
     // names content.
     assert!(matches!(
-        collect_structure(&objects, &[second], SnapshotLimits::default()).await,
+        collect(&objects, &[second]).await,
         Err(StructureCollectionError::Invalid { head, .. }) if head == second
     ));
     // A store that cannot collect is refused before anything is read.
     let separate = wheat_store::SeparateRepositoryStore::new(objects.clone(), content.clone());
     assert!(separate.collectable_structure().is_none());
     assert!(matches!(
-        collect_structure(&separate, &[second], SnapshotLimits::default()).await,
+        collect(&separate, &[second]).await,
         Err(StructureCollectionError::Unsupported)
     ));
     objects.get(ObjectId::from(first)).await.unwrap();
 }
+/// A store pairing the pool with the content the repository's publishes went to.
+fn network_store(
+    dir: &tempfile::TempDir,
+    objects: &PackedObjectStore,
+) -> wheat_store::NetworkStore<
+    PackedObjectStore,
+    wheat_store::SeparateRepositoryStore<PackedObjectStore>,
+> {
+    let content = ContentStore::new(dir.path().join("content"));
+    wheat_store::NetworkStore::new(
+        objects.clone(),
+        wheat_store::SeparateRepositoryStore::new(objects.clone(), content),
+    )
+}
+
+#[tokio::test]
+async fn a_head_that_moved_after_validation_is_validated_for_what_it_gained() {
+    let (dir, objects, first, second) = pool().await;
+    let store = network_store(&dir, &objects);
+    let validated = validate_heads(&store, PoolHeads::from([(1, first)]))
+        .await
+        .unwrap();
+    assert_eq!(validated.validated(), 1);
+
+    let collection = collect_structure(
+        &store,
+        &validated,
+        &PoolHeads::from([(1, second)]),
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((collection.extended, collection.revalidated), (1, 0));
+    assert!(missing(objects.get(ObjectId::from(first)).await));
+    objects.get(ObjectId::from(second)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_head_validation_did_not_see_or_that_went_back_is_validated_whole() {
+    let (dir, objects, first, second) = pool().await;
+    let store = network_store(&dir, &objects);
+    let validated = validate_heads(&store, PoolHeads::from([(1, second)]))
+        .await
+        .unwrap();
+
+    // Repository 1 went back to its first publish, which does not extend the second,
+    // and repository 2 is new; both are validated whole, each envelope once.
+    let collection = collect_structure(
+        &store,
+        &validated,
+        &PoolHeads::from([(1, first), (2, second), (3, first)]),
+        SnapshotLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((collection.extended, collection.revalidated), (0, 1));
+    assert_eq!(collection.sweep.objects_dropped, 0, "both heads are kept");
+    objects.get(ObjectId::from(first)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_head_that_does_not_validate_under_the_hold_removes_nothing() {
+    let (dir, objects, first, second) = pool().await;
+    let store = network_store(&dir, &objects);
+    let validated = validate_heads(&store, PoolHeads::from([(1, second)]))
+        .await
+        .unwrap();
+    let absent = RepositoryEnvelopeId::from_digest([7; 32]);
+
+    assert!(matches!(
+        collect_structure(
+            &store,
+            &validated,
+            &PoolHeads::from([(1, absent)]),
+            SnapshotLimits::default(),
+        )
+        .await,
+        Err(StructureCollectionError::Invalid { head, .. }) if head == absent
+    ));
+    assert!(matches!(
+        collect_structure(
+            &store,
+            &validated,
+            &PoolHeads::new(),
+            SnapshotLimits::default()
+        )
+        .await,
+        Err(StructureCollectionError::NoHeads)
+    ));
+    objects.get(ObjectId::from(first)).await.unwrap();
+}
+
 /// A process that stops while a pin holds what a sweep removed leaves the files
 /// behind; opening the store removes them.
 #[tokio::test]
@@ -356,9 +454,7 @@ async fn opening_removes_what_a_sweep_left_behind() {
             wheat_store::SeparateRepositoryStore::new(objects.clone(), content.clone()),
         );
         let pin = objects.pin();
-        let collection = collect_structure(&store, &[second], SnapshotLimits::default())
-            .await
-            .unwrap();
+        let collection = collect(&store, &[second]).await.unwrap();
         drop((store, content));
         objects.close().unwrap();
         let segments = dir.path().join("storage/packed/segments");

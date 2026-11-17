@@ -122,9 +122,9 @@ pub use snapshot::{
     stage_snapshot_from,
 };
 pub use structure_gc::{
-    CollectableStructure, Counts, ObjectMarks, PinnedObjects, StorePin, StoredInventory,
+    CollectableStructure, Counts, ObjectMarks, PinnedObjects, PoolHeads, StorePin, StoredInventory,
     StoredRecord, StructureCollection, StructureCollectionError, StructureReport, SweepReport,
-    analyze_structure, collect_structure,
+    ValidatedHeads, analyze_structure, collect_structure, validate_heads,
 };
 mod structural_delta;
 pub use structural_delta::{
