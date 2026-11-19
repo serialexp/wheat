@@ -176,15 +176,6 @@ between `wheat-native-protocol.md` and the code.
   files, so it does not show this. Options: store deltas as segment records, or skip
   deltas on the durable write path and leave them to repack. Measure with a case that
   modifies files first.
-- `[ ]` **A crash while retiring a sealed active segment duplicates its records.**
-  `seal_active` publishes the catalog snapshot naming the sealed segment, then
-  `retire_active` renames an empty log over `active.segment`. A crash in between
-  reopens the old log, so every record is in the sealed segment and in the active one,
-  and the next seal writes them into a second sealed segment. Reads are unaffected;
-  the space is lost until a repack. The removed `active.head` check meant to catch
-  this compared the active segment's ID with the sealed one's, which never matched
-  once sealing rebuilt the records with block compression. Fix: record in the log
-  which catalog generation sealed it, or retire before publishing.
 
 ## Security and performance scan (2026-09-26)
 

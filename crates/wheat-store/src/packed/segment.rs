@@ -1189,6 +1189,17 @@ fn hash_range_buffered(
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// The object count a segment's footer claims, read without authenticating the
+/// segment. It is only a hint: a caller that acts on it opens the segment.
+pub(crate) fn claimed_object_count(file: &mut File) -> Result<u64, SegmentError> {
+    let actual_len = file.metadata()?.len();
+    if actual_len < PREFIX_LEN + FOOTER_LEN {
+        return Err(SegmentError::Format("truncated or oversized"));
+    }
+    let footer = read_range(file, actual_len - FOOTER_LEN, FOOTER_LEN)?;
+    Ok(decode_segment_footer(&footer)?.object_count)
+}
+
 fn read_range(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>, SegmentError> {
     let size = usize::try_from(length).map_err(|_| SegmentError::Format("range too large"))?;
     let mut bytes = vec![0; size];

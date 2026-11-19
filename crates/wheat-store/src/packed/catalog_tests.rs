@@ -848,6 +848,93 @@ fn seal_errors_after_authority_publication_poison_writer_and_recover_on_reopen()
     }
 }
 
+/// How many records each sealed segment holds, in catalog order.
+fn sealed_record_counts(store: &mut PackedCatalog) -> Vec<usize> {
+    store
+        .sealed_segment_ids()
+        .unwrap()
+        .into_iter()
+        .map(|segment| store.sealed_records(segment).unwrap().len())
+        .collect()
+}
+
+#[test]
+fn a_log_sealed_before_a_crash_in_retirement_is_retired_on_open_not_sealed_again() {
+    let root = tempfile::tempdir().unwrap();
+    let sealed = [record(b"sealed once"), record(b"and only once")];
+    let later = record(b"appended after recovery");
+    {
+        let mut store = PackedCatalog::open_with_test_threshold(
+            root.path(),
+            crate::Durability::Durable,
+            u64::MAX,
+        )
+        .unwrap();
+        store.put_records(&sealed).unwrap();
+    }
+    {
+        // The next put seals the two-record log first, and fails retiring it.
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.test_set_seal_failpoint(SealFailpoint::DuringRetirement);
+        assert!(store.put_records(&[record(b"triggers the seal")]).is_err());
+    }
+
+    let mut reopened =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+            .unwrap();
+    assert_eq!(
+        reopened.physical_authority().unwrap().active.object_count,
+        0
+    );
+    assert_eq!(sealed_record_counts(&mut reopened), [2]);
+    for value in sealed {
+        assert_value(&mut reopened, value);
+    }
+
+    // The next seal holds only what came after; before the fix it sealed the
+    // retired log's records a second time.
+    reopened.put_records(&[later]).unwrap();
+    assert_eq!(sealed_record_counts(&mut reopened), [2, 1]);
+    for value in sealed.into_iter().chain([later]) {
+        assert_value(&mut reopened, value);
+    }
+}
+
+#[test]
+fn a_log_appended_since_its_last_seal_is_kept_on_open() {
+    let root = tempfile::tempdir().unwrap();
+    let sealed = record(b"sealed before");
+    let pending = record(b"logged since, as many records as the seal");
+    {
+        let mut store =
+            PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, 1)
+                .unwrap();
+        store.put_records(&[sealed]).unwrap();
+    }
+    {
+        let mut store = PackedCatalog::open_with_test_threshold(
+            root.path(),
+            crate::Durability::Durable,
+            u64::MAX,
+        )
+        .unwrap();
+        store.put_records(&[pending]).unwrap();
+    }
+
+    let mut reopened =
+        PackedCatalog::open_with_test_threshold(root.path(), crate::Durability::Durable, u64::MAX)
+            .unwrap();
+    assert_eq!(
+        reopened.physical_authority().unwrap().active.object_count,
+        1
+    );
+    assert_eq!(sealed_record_counts(&mut reopened), [1]);
+    assert_value(&mut reopened, sealed);
+    assert_value(&mut reopened, pending);
+}
+
 #[test]
 fn an_interrupted_active_creation_recovers_but_a_damaged_log_header_is_rejected() {
     let fresh = tempfile::tempdir().unwrap();

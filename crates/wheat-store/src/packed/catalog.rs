@@ -33,7 +33,7 @@ use super::{
     segment::{
         CheckedRecord, MAX_SEGMENT_PAYLOAD_BYTES, METADATA_NAMESPACE, PreparedSegmentRecord,
         SealedSegment, SegmentBuilder, SegmentError, SegmentReader, SegmentRecord, VerifiedPayload,
-        prepare_delta_record, prepare_record, verify_payload,
+        claimed_object_count, prepare_delta_record, prepare_record, verify_payload,
     },
     trace::PackedStoreTraceCounters,
 };
@@ -698,7 +698,7 @@ impl PackedCatalog {
         // may write, and an open that created the directories may have crashed before
         // syncing them. Otherwise nothing is written yet, and a read-only command
         // never pays for the sync.
-        let ancestors_pending = !(created || unclean);
+        let mut ancestors_pending = !(created || unclean);
         if !ancestors_pending {
             sync_created_ancestors(&root, durability)?;
         }
@@ -717,7 +717,14 @@ impl PackedCatalog {
         };
         recover_repack_intent(&root, durable_head, durability)?;
         let authority = read_catalog_authority(&catalogs, durable_head)?;
-        let active = recover_active(&root, durability)?;
+        let mut active = recover_active(&root, durability)?;
+        if active_was_sealed(&root, authority.as_ref(), &active)? {
+            if ancestors_pending {
+                sync_created_ancestors(&root, durability)?;
+                ancestors_pending = false;
+            }
+            retire_active(&root, &mut active, durability, false)?;
+        }
         remove_unpublished_bulk_files(&segments, durability)?;
         remove_temporary_files(&root, &segments, durability)?;
         remove_unreachable_publications(
@@ -2637,6 +2644,54 @@ fn recover_active(root: &Path, durability: Durability) -> Result<ActiveSegment, 
     Ok(active)
 }
 
+/// Whether the newest published segment already holds every record of the
+/// active log: a seal published it, and the crash came before the log was
+/// retired. Kept, the log would be sealed a second time into a segment of
+/// duplicates.
+///
+/// Records are content-addressed, so equal keys are equal records, and a log
+/// whose keys a published segment holds has nothing left to seal, whichever
+/// publication wrote that segment. The footer's count rules out the usual case,
+/// a log appended to since its seal, before the segment is read and
+/// authenticated.
+fn active_was_sealed(
+    root: &Path,
+    authority: Option<&PhysicalCatalogSnapshot>,
+    active: &ActiveSegment,
+) -> Result<bool, CatalogError> {
+    let object_count = active.state().object_count;
+    let Some(snapshot) = authority.filter(|_| object_count > 0) else {
+        return Ok(false);
+    };
+    let Some(newest) = snapshot
+        .segments
+        .iter()
+        .find(|item| item.generation == snapshot.generation && item.sequence == 0)
+    else {
+        return Ok(false);
+    };
+    let path = root.join(segment_source_path(
+        newest.generation,
+        newest.sequence,
+        &newest.segment,
+    ));
+    let mut file = File::open(&path)?;
+    if claimed_object_count(&mut file)? != object_count {
+        return Ok(false);
+    }
+    let reader = SegmentReader::open(file)?;
+    if reader.id().0 != newest.segment {
+        return Err(CatalogError::Corrupt(
+            "segment identity disagrees with catalog",
+        ));
+    }
+    let sealed = reader.authenticated_entries();
+    Ok(sealed.len() == active.entries().len()
+        && sealed.iter().zip(active.entries()).all(|(sealed, logged)| {
+            (sealed.namespace, sealed.digest) == (logged.namespace, logged.digest)
+        }))
+}
+
 /// The block-compressed replacement need not equal the active segment's byte
 /// identity; publication authenticated the replacement before this step.
 fn retire_active(
@@ -3139,18 +3194,20 @@ fn read_catalog_authority(
     Ok(Some(snapshot))
 }
 
+/// A published segment's path relative to the store root.
+fn segment_source_path(generation: u64, sequence: u64, segment: &[u8; 32]) -> String {
+    format!(
+        "segments/{generation}-{sequence}-{}{SEGMENT_SUFFIX}",
+        hex(segment)
+    )
+}
+
 fn authority_sources(snapshot: &PhysicalCatalogSnapshot) -> Vec<SealedSource> {
     snapshot
         .segments
         .iter()
         .map(|item| SealedSource {
-            path: format!(
-                "segments/{}-{}-{}{}",
-                item.generation,
-                item.sequence,
-                hex(&item.segment),
-                SEGMENT_SUFFIX
-            ),
+            path: segment_source_path(item.generation, item.sequence, &item.segment),
             generation: item.generation,
             sequence: item.sequence,
             segment: item.segment,

@@ -377,6 +377,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   the write, a reused key), and `remote_publish`
   `a_publish_whose_answer_is_lost_is_sent_again_and_published_once` (a proxy drops the
   first `PublishResult`).
+- `[x]` **A crash while retiring a sealed active segment duplicates its records.**
+  Fixed 2026-11-19 without a format change: opening the store now retires an active
+  log whose records the newest published segment (head generation, sequence 0)
+  already holds. Records are content-addressed, so equal key sets mean nothing is
+  left to seal. The segment footer's object count is read first, so the usual open
+  (a log appended to since its seal) reads only that footer. The newest segment is
+  authenticated and compared only when the counts match. Tests in `catalog_tests.rs`:
+  `a_log_sealed_before_a_crash_in_retirement_is_retired_on_open_not_sealed_again`
+  (it fails without the check) and `a_log_appended_since_its_last_seal_is_kept_on_open`.
 
 ## Security and performance scan (2026-09-26)
 
