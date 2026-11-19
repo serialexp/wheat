@@ -2534,6 +2534,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         .iter()
         .filter(|application| !application.reused_anchor)
         .count();
+    let new_commits = prepared.new_commits;
     let tip = prepared
         .export
         .tip
@@ -2546,8 +2547,8 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
         format!("{destination} is already at {tip}\n")
     } else {
         format!(
-            "pushed {projected} commit{} (one per change) to {destination} at {tip}\n",
-            if projected == 1 { "" } else { "s" },
+            "pushed {new_commits} commit{} (one per change) to {destination} at {tip}\n",
+            if new_commits == 1 { "" } else { "s" },
         )
     };
     Success::new(
@@ -2556,6 +2557,7 @@ fn push(root: &std::path::Path, arguments: PushArgs) -> Result<Success> {
             "destination": destination,
             "tip": tip.to_string(),
             "projected_commits": projected,
+            "pushed_commits": new_commits,
             "up_to_date": up_to_date,
             "export": {
                 "trees_read": work.trees_read,

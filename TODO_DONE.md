@@ -243,6 +243,15 @@ Finished items, moved here from `TODO.md` under the same headings.
   given metadata), CLI `integrate.rs`
   `a_conflict_on_two_paths_resolves_from_the_workspace` (`wheat log` shows the actor,
   message and dates).
+- `[x]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
+  Its report said "pushed N commits" for the whole exported chain, not the commits the
+  remote lacked. Fixed 2026-11-19: when the remote's tip doesn't anchor the export and
+  the whole chain is projected again, `prepare_push` counts the commits the remote
+  lacks with `git rev-list --count <tip> ^<remote tip>` in the projection (which
+  `cache_observed_ref` already holds the remote's tip in); an anchored push counts
+  what follows the anchor, as before. The JSON adds `pushed_commits` beside
+  `projected_commits`. Test: `git_push.rs`
+  `a_forced_push_counts_only_the_commits_the_remote_lacked` (5 projected, 1 pushed).
 
 - `[x]` **A native pull or fetch without `remote.meta` is an internal error
   (2026-10-21).** Fixed 2026-10-29: `resolve_remote` refuses with `invalid_input` and

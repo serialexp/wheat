@@ -340,6 +340,97 @@ fn a_change_ordered_before_imported_history_is_never_dropped_from_a_push() {
     }
 }
 
+/// A forced push over a commit it doesn't know projects the whole chain again, but
+/// reports only the commits the remote lacked: not the imported ones, nor the native
+/// one pushed before.
+#[test]
+fn a_forced_push_counts_only_the_commits_the_remote_lacked() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let remote = root.path().join("remote.git");
+    let other = root.path().join("other");
+    let repository = root.path().join("wheat");
+    git(None, &["init", "-b", "main", source.to_str().unwrap()]);
+    for name in ["one", "two", "three"] {
+        std::fs::write(source.join(name), name).unwrap();
+        git(Some(&source), &["add", name]);
+        git(Some(&source), &["commit", "-m", name]);
+    }
+    git(None, &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        Some(&source),
+        &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
+    );
+    let imported = wheat(
+        &repository,
+        &[
+            "import",
+            source.to_str().unwrap(),
+            repository.to_str().unwrap(),
+            "--branch",
+            "refs/heads/main",
+        ],
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let push = |extra: &[&str]| {
+        let mut arguments = vec![
+            "--format=json",
+            "push",
+            remote.to_str().unwrap(),
+            "--to",
+            "refs/heads/main",
+        ];
+        arguments.extend_from_slice(extra);
+        let output = wheat(&repository, &arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"].clone()
+    };
+    let created = wheat(
+        &repository,
+        &["change", "new", "--path", "first", "--value", "first"],
+    );
+    assert!(created.status.success());
+    let first = push(&[]);
+    assert_eq!(first["pushed_commits"], 1, "{first}");
+
+    // Someone else adds a commit the Wheat store never sees.
+    git(
+        None,
+        &[
+            "clone",
+            "--branch",
+            "main",
+            remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("foreign"), b"foreign").unwrap();
+    git(Some(&other), &["add", "foreign"]);
+    git(Some(&other), &["commit", "-m", "foreign"]);
+    git(Some(&other), &["push", "origin", "HEAD:refs/heads/main"]);
+
+    let created = wheat(
+        &repository,
+        &["change", "new", "--path", "second", "--value", "second"],
+    );
+    assert!(created.status.success());
+    let forced = push(&["--force-with-lease"]);
+    assert_eq!(forced["projected_commits"], 5, "{forced}");
+    assert_eq!(forced["pushed_commits"], 1, "{forced}");
+    assert_eq!(
+        git(Some(&remote), &["rev-list", "--count", "refs/heads/main"]),
+        "5"
+    );
+}
+
 #[test]
 fn unknown_remote_tip_is_rejected_without_force_with_lease() {
     let root = tempfile::tempdir().unwrap();

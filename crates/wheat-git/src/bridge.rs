@@ -15,8 +15,8 @@ use crate::{
     },
     push::{
         PushError, PushMode, PushReport, RemoteOid, RemoteState, cache_observed_ref,
-        fetch_remote_heads, is_ancestor, observe_remote_ref, observe_remote_tag, push_ref,
-        push_tag, remote_heads_contain,
+        count_commits_not_in, fetch_remote_heads, is_ancestor, observe_remote_ref,
+        observe_remote_tag, push_ref, push_tag, remote_heads_contain,
     },
 };
 
@@ -49,6 +49,8 @@ pub struct PreparedPush {
     pub destination_ref: String,
     pub remote_state: RemoteState,
     pub export: ExportResult,
+    /// The commits the push gives the remote: those of the projection it doesn't have.
+    pub new_commits: usize,
     remote_url: String,
     pub force_with_lease: bool,
     _lock: ProjectionLock,
@@ -121,30 +123,40 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         options.anchor = ExportAnchor::Commit(oid.object_id()?);
     }
 
-    let export =
+    let (export, new_commits) =
         match export_revision_history(objects, content, selected, base, changes, &git, &options)
             .await
         {
-            Ok(export) => export,
+            // Everything after the anchor, the remote's tip, is new to it; with no
+            // remote branch, everything is.
+            Ok(export) => {
+                let new_commits = export
+                    .projected
+                    .iter()
+                    .filter(|application| !application.reused_anchor)
+                    .count();
+                (export, new_commits)
+            }
             Err(ExportError::UnmatchedAnchor(_)) | Err(ExportError::MissingAnchor(_)) => {
                 options.anchor = ExportAnchor::None;
                 let complete = export_revision_history(
                     objects, content, selected, base, changes, &git, &options,
                 )
                 .await?;
-                if !force_with_lease {
-                    let tip = complete.tip.ok_or(BridgeError::EmptyProjection)?;
-                    let RemoteState::Present(oid) = &remote_state else {
-                        unreachable!("an unmatched anchor requires a present remote ref")
-                    };
-                    if !is_ancestor(projection_path, oid, tip)? {
-                        return Err(BridgeError::UnknownRemoteTip {
-                            destination: destination.into(),
-                            oid: oid.as_str().into(),
-                        });
-                    }
+                let tip = complete.tip.ok_or(BridgeError::EmptyProjection)?;
+                let RemoteState::Present(oid) = &remote_state else {
+                    unreachable!("an unmatched anchor requires a present remote ref")
+                };
+                if !force_with_lease && !is_ancestor(projection_path, oid, tip)? {
+                    return Err(BridgeError::UnknownRemoteTip {
+                        destination: destination.into(),
+                        oid: oid.as_str().into(),
+                    });
                 }
-                complete
+                // The whole chain was projected again, but the remote may already have
+                // much of it: imported commits, and native ones below a rewrite.
+                let new_commits = count_commits_not_in(projection_path, tip, oid)?;
+                (complete, new_commits)
             }
             Err(error) => return Err(error.into()),
         };
@@ -166,6 +178,7 @@ pub async fn prepare_push<O: ImmutableObjectStore>(
         destination_ref: destination.into(),
         remote_state,
         export,
+        new_commits,
         remote_url: remote_url.into(),
         force_with_lease,
         _lock: lock,

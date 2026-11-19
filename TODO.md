@@ -124,9 +124,6 @@ Besides labels never moving (they move since 2026-10-26, `docs/design/wheat-labe
 `wheat://` (TLS item below) and read-only commands paying a full validation (1.4 s
 for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
 
-- `[ ]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
-  Its report says "pushed N commits" for the whole exported chain, not the commits
-  the remote lacked.
 - `[ ]` **A Git push still walks the whole application chain (2026-10-21).**
   `export.rs` `reconstruct_chain` steps from the selected view down to the base, about
   11 object reads per change (136 ms at 2,000 changes), before finding the anchor. It

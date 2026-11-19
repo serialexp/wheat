@@ -439,6 +439,35 @@ fn object_is_complete(projection: &Path, oid: &RemoteOid) -> Result<bool, PushEr
     Ok(status.success())
 }
 
+/// How many commits reachable from `tip` are not reachable from `remote`, in the
+/// projection repository: what a push of `tip` over `remote` gives the remote. The
+/// remote's commit must be in the projection ([`cache_observed_ref`] puts it there).
+pub fn count_commits_not_in(
+    projection: &Path,
+    tip: gix::ObjectId,
+    remote: &RemoteOid,
+) -> Result<usize, PushError> {
+    validate_projection(projection)?;
+    let output = run_git(
+        Command::new("git")
+            .arg("-C")
+            .arg(projection)
+            .arg("rev-list")
+            .arg("--count")
+            .arg(tip.to_string())
+            .arg(format!("^{}", remote.as_str()))
+            .arg("--"),
+        "rev-list",
+    )?;
+    require_success("rev-list", &output)?;
+    output
+        .stdout
+        .to_string_lossy()
+        .trim()
+        .parse()
+        .map_err(|_| PushError::InvalidRemoteOutput("rev-list --count returned no count".into()))
+}
+
 /// Return whether `ancestor` is reachable from `descendant` in the projection repository.
 pub fn is_ancestor(
     projection: &Path,
