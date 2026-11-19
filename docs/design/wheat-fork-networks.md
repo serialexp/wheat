@@ -80,6 +80,13 @@ and move them from Outstanding to Done.
   `TODO.md`. Deleting a network leaves its content in the content store until then.
 - [ ] **Superseded — phases 2 and 3.** Reads limited to the repository's closure
   and publishes proving possession are not needed after the 2026-10-27 decisions.
+- [x] **Syncing a fork from its network (2026-11-19).** `StageBuilder::join_state`
+  joins another envelope's state in the network into a stage's tip, keeping the tip's
+  labels, so the stage's write can move a fork's label to a view only the upstream
+  held (fork sync, fetching a pull request's head across forks). A state holding a
+  change the other records differently is refused as `Rejected`, an envelope outside
+  the network as `Invalid`. Bench case `server_stage`, step `join`: 229 reads at
+  10,000 changes, 1.7% more per doubling.
 - [ ] **Defer — detaching a fork.** Copying one repository's closure into a network
   of its own (for a visibility change, say).
 

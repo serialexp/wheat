@@ -5,6 +5,7 @@ use crate::support;
 
 use std::collections::BTreeSet;
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -614,4 +615,163 @@ async fn a_stage_holds_off_a_quiesce_and_is_refused_by_one() {
     );
     drop(held);
     open_stage(&server.entry).await.unwrap();
+}
+
+/// A fork of `server`'s repository: a head of its own in the same network, starting at
+/// the upstream's, as a fork of a served network is made.
+async fn fork_of(server: &Server, dir: &Path) -> Arc<RepositoryEntry> {
+    let upstream = server.entry.heads.head().await.unwrap();
+    let heads = LocalPublicationStore::new(dir.join("fork.head"));
+    PublicationStore::initialize(&heads, RepositoryHead::initial(upstream.envelope)).unwrap();
+    Arc::new(RepositoryEntry::in_network(
+        server.entry.network.clone(),
+        heads,
+    ))
+}
+
+/// Publishes to `entry` one change writing `path` on `from`, moving `label` from
+/// `from` to the view after it, and answers that view.
+async fn publish_edit(
+    entry: &Arc<RepositoryEntry>,
+    key: u8,
+    label: &str,
+    from: ViewId,
+    path: &'static str,
+    value: &'static [u8],
+) -> ViewId {
+    let stage = open_stage(entry).await.unwrap();
+    let edited = edit_in(&stage, from, path, value).await;
+    stage
+        .submit(
+            server_write(key, vec![change(label, View(from), Some(edited))]),
+            INTENT,
+        )
+        .await
+        .unwrap();
+    edited
+}
+
+#[tokio::test]
+async fn a_fork_joins_what_its_upstream_published_and_moves_its_label_there() {
+    let naming = Arc::new(Recording::default());
+    let server = server(Some(Arc::clone(&naming))).await;
+    let fork = fork_of(&server, server._dir.path()).await;
+    let edited = publish_edit(&server.entry, 1, "main", server.first, "new.txt", b"new").await;
+    let upstream = server.entry.heads.head().await.unwrap();
+
+    // The fork's state doesn't hold the upstream's new view, so its label can't name
+    // it until the states are joined.
+    let refused = write(
+        &fork,
+        server_write(2, vec![change("main", View(server.first), Some(edited))]),
+    )
+    .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(WriteFailure::Commit(CommitFailure::Rejected { .. }))
+        ),
+        "{refused:?}"
+    );
+
+    naming.calls.lock().unwrap().clear();
+    let stage = open_stage(&fork).await.unwrap();
+    let base = stage.base();
+    let joined = stage
+        .build(move |builder| async move { builder.join_state(upstream.envelope).await })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(joined.generation, base.generation + 1);
+    assert_eq!(stage.head(), joined, "the join moved the tip");
+    assert_eq!(
+        fork.heads.head().await.unwrap(),
+        base,
+        "nothing is published yet"
+    );
+
+    let published = stage
+        .submit(
+            server_write(3, vec![change("main", View(server.first), Some(edited))]),
+            INTENT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        labels(&server, published).await,
+        [
+            ("feature".to_owned(), server.other),
+            ("main".to_owned(), edited)
+        ]
+    );
+    assert_eq!(
+        files(&server, edited, &["one.txt", "new.txt"]).await,
+        [Some(ContentId::of(b"one")), Some(ContentId::of(b"new"))]
+    );
+    // The fork now relies on the upstream's new file, so the submit named it.
+    assert_eq!(*naming.calls.lock().unwrap(), [vec![ContentId::of(b"new")]]);
+    // The upstream is as it was.
+    assert_eq!(server.entry.heads.head().await.unwrap(), upstream);
+}
+
+#[tokio::test]
+async fn a_join_keeps_what_the_fork_published_itself() {
+    let server = server(None).await;
+    let fork = fork_of(&server, server._dir.path()).await;
+    let forked = publish_edit(&fork, 1, "feature", server.other, "fork.txt", b"fork").await;
+    let edited = publish_edit(&server.entry, 2, "main", server.first, "new.txt", b"new").await;
+    let upstream = server.entry.heads.head().await.unwrap();
+
+    let stage = open_stage(&fork).await.unwrap();
+    stage
+        .build(move |builder| async move { builder.join_state(upstream.envelope).await })
+        .await
+        .unwrap()
+        .unwrap();
+    let published = stage
+        .submit(
+            server_write(3, vec![change("main", View(server.first), Some(edited))]),
+            INTENT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        labels(&server, published).await,
+        [("feature".to_owned(), forked), ("main".to_owned(), edited)]
+    );
+    assert_eq!(
+        files(&server, forked, &["three.txt", "fork.txt"]).await,
+        [Some(ContentId::of(b"three")), Some(ContentId::of(b"fork"))]
+    );
+}
+
+#[tokio::test]
+async fn joining_a_state_the_tip_already_holds_moves_nothing() {
+    let server = server(None).await;
+    let fork = fork_of(&server, server._dir.path()).await;
+    let upstream = server.entry.heads.head().await.unwrap();
+    let stage = open_stage(&fork).await.unwrap();
+    let tip = stage
+        .build(move |builder| async move { builder.join_state(upstream.envelope).await })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tip, stage.base());
+}
+
+#[tokio::test]
+async fn an_envelope_from_another_network_is_refused() {
+    let server = server(None).await;
+    let elsewhere = self::server(None).await;
+    let theirs = elsewhere.entry.heads.head().await.unwrap();
+    let stage = open_stage(&server.entry).await.unwrap();
+    let refused = stage
+        .build(move |builder| async move { builder.join_state(theirs.envelope).await })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&refused, Err(WriteFailure::Invalid(message)) if message.contains("not in this repository's network")),
+        "{refused:?}"
+    );
+    assert_eq!(stage.head(), stage.base());
 }

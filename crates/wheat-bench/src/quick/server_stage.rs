@@ -7,11 +7,15 @@
 //! - `edit`: a stage creating one change on the history's view, submitted creating
 //!   a label at it;
 //! - `merge`: two such changes submitted under labels of their own, then a stage
-//!   integrating both into one view, submitted creating a label at it.
+//!   integrating both into one view, submitted creating a label at it;
+//! - `join`: a fork of the repository, made before the upstream published one more
+//!   change, joining the upstream's state in a stage, submitted moving its label to
+//!   that change's view, as a fork sync does.
 //!
 //! The mutator reads the collections down to the change it composes, the submit
-//! compares the built state with the base's and validates the transition, and the
-//! merge reads the two changes it joins, so what each reads grows with the history only
+//! compares the built state with the base's and validates the transition, the merge
+//! reads the two changes it joins, and the join's union reads the collections down to
+//! where the two states differ, so what each reads grows with the history only
 //! as the collections deepen, with its logarithm: from the shortest history to the
 //! longest, each grows by at most [`READ_GROWTH_PER_BIT`] percent of the shortest's per
 //! doubling of the history.
@@ -28,7 +32,8 @@ use wheat_server::{
     write::{ExpectedLabel, LabelChange, ServerStage, ServerWrite, open_stage},
 };
 use wheat_store::{
-    ImmutableObjectStore, ObjectStoreError, PublicationStore, SeparateRepositoryStore, StoredObject,
+    Durability, ImmutableObjectStore, LocalPublicationStore, ObjectStoreError, PublicationStore,
+    RepositoryHead, SeparateRepositoryStore, StoredObject,
 };
 
 use super::{
@@ -42,10 +47,11 @@ const CHECKPOINTS: [usize; 2] = [1_000, 10_000];
 /// Most an operation's reads may grow per doubling of the history, in percent of what
 /// it read at the shortest. Measured 2026-11-07 (release) at 1,000 and 10,000 changes:
 /// edit 108 and 125 reads, merge 122 and 147, so 4.7% and 6.2% per doubling, against
-/// 100% if they grew with the history. The collections gain levels in steps, so the
-/// budget leaves room for one more.
+/// 100% if they grew with the history. A fork's join and label move, measured
+/// 2026-11-19: 217 and 229 reads, 1.7% per doubling. The collections gain levels in
+/// steps, so the budget leaves room for one more.
 const READ_GROWTH_PER_BIT: f64 = 15.0;
-const STEPS: [&str; 2] = ["edit", "merge"];
+const STEPS: [&str; 3] = ["edit", "merge", "join"];
 
 pub(crate) fn run(context: &CaseContext) -> Result<CaseOutput> {
     let checkpoints = context.scale.pick(CHECKPOINTS.to_vec(), vec![20, 60]);
@@ -168,7 +174,7 @@ async fn measure(
     root: &Path,
     checkpoints: &[usize],
     recorder: &mut Recorder,
-) -> Result<Vec<[u64; 2]>> {
+) -> Result<Vec<[u64; 3]>> {
     std::fs::create_dir_all(root)?;
     let scratch = Scratch::open(root)?;
     let (base, mut head) = scratch.initialize().await?;
@@ -263,9 +269,57 @@ async fn measure(
         recorder.value(&format!("{step}.merge.reads"), merge as f64, "count");
         extra += 1;
 
+        // A fork of the repository as it is now, then one more change upstream.
+        let forked = scratch.heads.read().context("read the head")?;
+        let fork_heads = LocalPublicationStore::with_durability(
+            root.join(format!("fork-{changes}.head")),
+            Durability::Deferred,
+        );
+        fork_heads
+            .initialize(RepositoryHead::initial(forked.envelope))
+            .context("create the fork's head")?;
+        let fork = Arc::new(RepositoryEntry::in_network(
+            entry.network.clone(),
+            fork_heads,
+        ));
+        let stage = open_stage(&entry)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let upstream_view = edit_in(&stage, effective, extra).await?;
+        stage
+            .submit(
+                label_write(extra, &format!("{step}/upstream"), upstream_view),
+                intent(extra),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        extra += 1;
+        let upstream = scratch.heads.read().context("read the head")?;
+        counting.take();
+        let started = Instant::now();
+        let stage = open_stage(&fork)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        stage
+            .build(move |builder| async move { builder.join_state(upstream.envelope).await })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        stage
+            .submit(
+                label_write(extra, &format!("{step}/upstream"), upstream_view),
+                intent(extra),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        recorder.wall(&format!("{step}.join"), started.elapsed().as_secs_f64());
+        let join = counting.take().0;
+        recorder.value(&format!("{step}.join.reads"), join as f64, "count");
+        extra += 1;
+
         // The history goes on from the head the stages published.
         head = scratch.heads.read().context("read the head")?;
-        reads.push([edit, merge]);
+        reads.push([edit, merge, join]);
     }
     std::fs::remove_dir_all(root)?;
     Ok(reads)

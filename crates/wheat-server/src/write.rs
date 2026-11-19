@@ -22,12 +22,13 @@ use tokio::time::Instant;
 use tracing::{Instrument as _, debug_span, warn};
 pub use wheat_core::ExpectedLabel;
 use wheat_core::{
-    ViewId, ViewLabel, ViewLabelManifestRecord, server_stage_request_digest,
-    server_write_request_digest,
+    RepositoryEnvelopeId, RepositoryEnvelopeRecord, ViewId, ViewLabel, ViewLabelManifestRecord,
+    server_stage_request_digest, server_write_request_digest,
 };
 use wheat_store::{
-    PUBLISH_RECEIPT_RETENTION_SECONDS, PersistedRepositoryMutator, PublicationError,
-    PublicationStore, RepositoryHead, RepositoryReader, RepositoryStage,
+    ImmutableObjectStore as _, ObjectStoreError, PUBLISH_RECEIPT_RETENTION_SECONDS,
+    PersistedRepositoryMutator, PublicationError, PublicationStore, RepositoryHead,
+    RepositoryPublicationError, RepositoryReader, RepositoryStage, RepositoryUnionError,
 };
 
 use crate::{
@@ -261,6 +262,80 @@ impl StageBuilder {
     #[must_use]
     pub fn content(&self) -> &wheat_store::ContentStore {
         self.inner.stage.content()
+    }
+
+    /// Joins the state of `other` into the tip: the tip's state becomes the union of
+    /// the two, and its labels stay the tip's. Answers the tip afterwards, which is the
+    /// tip as it was when `other`'s state holds nothing the tip's lacks.
+    ///
+    /// `other` is an envelope of this network's pool, typically another repository's
+    /// head, as when a fork takes in what its upstream published. Its labels are not
+    /// taken: move them in the write, which may then name any view `other` holds. The
+    /// submit validates what the join adds, as it validates any build.
+    ///
+    /// Both states must start from the same base view and agree on each change both
+    /// record, or the join is [`CommitFailure::Rejected`]. An `other` the pool doesn't
+    /// hold is [`WriteFailure::Invalid`]. The cost follows how far the two states grew
+    /// apart, not how much history they hold ([`RepositoryReader::union_states`]).
+    #[tracing::instrument(name = "server_stage_join", level = "debug", skip_all)]
+    pub async fn join_state(
+        &self,
+        other: RepositoryEnvelopeId,
+    ) -> Result<RepositoryHead, WriteFailure> {
+        let tip = self.inner.tip.get();
+        let internal = |what: &str, e: &dyn std::error::Error| {
+            WriteFailure::Commit(CommitFailure::Internal(format!(
+                "server stage: {what}: {}",
+                chain(e)
+            )))
+        };
+        let reader = self.reader();
+        let here = reader
+            .envelope(tip.envelope)
+            .await
+            .map_err(|e| internal("read the tip", &e))?;
+        let there = match reader.envelope(other).await {
+            Ok(there) => there,
+            Err(RepositoryPublicationError::Object(ObjectStoreError::Missing(_))) => {
+                return Err(WriteFailure::Invalid(format!(
+                    "envelope {other} is not in this repository's network"
+                )));
+            }
+            Err(e) => return Err(internal("read the envelope to join", &e)),
+        };
+        let state = match reader.union_states(here.state, there.state).await {
+            Ok(state) => state,
+            Err(
+                e @ (RepositoryUnionError::DifferentBaseView { .. }
+                | RepositoryUnionError::DivergentChanges(_)),
+            ) => {
+                return Err(WriteFailure::Commit(CommitFailure::Rejected {
+                    head: self.inner.base,
+                    message: format!("the states cannot be joined: {e}"),
+                }));
+            }
+            Err(e) => return Err(internal("join the states", &e)),
+        };
+        if state == here.state {
+            return Ok(tip);
+        }
+        let envelope = RepositoryEnvelopeRecord {
+            state,
+            labels: here.labels,
+        };
+        self.inner
+            .stage
+            .put_if_absent(envelope.id().into(), &envelope.canonical_bytes())
+            .await
+            .map_err(|e| internal("stage the joined envelope", &e))?;
+        let joined = tip
+            .next(envelope.id())
+            .map_err(|e| internal("number the joined tip", &e))?;
+        self.inner
+            .tip
+            .compare_and_advance(tip, joined)
+            .map_err(|e| internal("move the tip", &e))?;
+        Ok(joined)
     }
 }
 
