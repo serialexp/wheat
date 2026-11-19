@@ -285,8 +285,8 @@ fn inspects_and_mutates_an_atomic_packed_repository() {
         &repository,
         &[
             "resolve",
+            "--revision",
             &field(&dependent, "revision"),
-            "--path",
             "added",
             "--value",
             "resolved",
@@ -466,7 +466,6 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
             "--format",
             "json",
             "resolve",
-            "--path",
             "not-conflicted",
             "--value",
             "unreachable",
@@ -479,7 +478,7 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
 
     let resolved = wheat(
         directory.path(),
-        &["resolve", "--path", "shared", "--value", "resolved"],
+        &["resolve", "shared", "--value", "resolved"],
     );
     assert!(
         resolved.status.success(),
@@ -520,6 +519,55 @@ fn revises_a_stack_and_resolves_a_conflict_after_reopening() {
         follow_up.status.success(),
         "{}",
         String::from_utf8_lossy(&follow_up.stderr)
+    );
+}
+
+/// Runs `wheat` and returns its JSON result, failing the test when it fails.
+fn wheat_ok(directory: &std::path::Path, arguments: &[&str]) -> serde_json::Value {
+    let mut full = vec!["--format", "json"];
+    full.extend_from_slice(arguments);
+    let output = wheat(directory, &full);
+    assert!(
+        output.status.success(),
+        "{arguments:?}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"].clone()
+}
+
+/// A binary file an earlier change made is added to a later one as a whole file: it is
+/// not text, so it cannot be normalized as guarded edits.
+#[test]
+fn a_binary_file_from_an_earlier_change_adds_to_a_later_one() {
+    let directory = sandbox();
+    let root = directory.path();
+    wheat_ok(root, &["init"]);
+    wheat_ok(
+        root,
+        &["change", "new", "-m", "a", "--path", "x", "--value", "x"],
+    );
+    std::fs::write(root.join("y"), "base\0").unwrap();
+    wheat_ok(root, &["add", "-m", "a", "y"]);
+    wheat_ok(
+        root,
+        &["change", "new", "-m", "b", "--path", "z", "--value", "z"],
+    );
+    std::fs::write(root.join("y"), "later\0").unwrap();
+
+    wheat_ok(root, &["add", "-m", "b", "y"]);
+
+    assert_workspace_is_the_view(root);
+}
+
+/// The workspace holds exactly the working view: nothing changed or untracked.
+fn assert_workspace_is_the_view(root: &std::path::Path) {
+    let status = wheat_ok(root, &["status"]);
+    assert_eq!(status["changes"], serde_json::json!([]), "{status:#}");
+    let untracked = status["untracked"].as_array().unwrap();
+    assert!(
+        untracked.iter().all(|entry| entry["path"] == ".wheat"),
+        "{status:#}"
     );
 }
 

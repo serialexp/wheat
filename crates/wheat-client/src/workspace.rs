@@ -196,9 +196,10 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
                 .iter()
                 .all(|(_, e)| matches!(e.operation, EditOperation::GuardedText { .. }))
             && !past_bound(b)?;
-        if can_normalize {
-            let a = a.unwrap();
-            let b = b.unwrap();
+        // Guarded normalization takes text on all three sides; a binary side is
+        // captured as a whole-file transition below, as capture would.
+        let normalizable = if can_normalize {
+            let (a, b) = (a.unwrap(), b.unwrap());
             let Some(Captured::Bytes(w)) = file.as_ref() else {
                 unreachable!("matched above")
             };
@@ -208,6 +209,20 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
             let baseline_bytes = store
                 .get(b.content)
                 .context("cannot resolve applied baseline file")?;
+            let text = |kind, bytes: &[u8]| {
+                wheat_core::edit_capture::is_guarded_text(
+                    FileSnapshot { kind, bytes },
+                    limits.into(),
+                )
+            };
+            (text(a.kind, &authored_bytes)
+                && text(b.kind, &baseline_bytes)
+                && text(w.kind, &w.bytes))
+            .then_some((a, w, authored_bytes, baseline_bytes))
+        } else {
+            None
+        };
+        if let Some((a, w, authored_bytes, baseline_bytes)) = normalizable {
             let mut definitions = Vec::with_capacity(old_on_path.len());
             for (_, record) in old_on_path {
                 definitions.push(resolve_guard(record, store)?);
@@ -601,6 +616,26 @@ fn read_captured(
             bytes: canonical_workspace(&snapshot),
         })
     }))
+}
+
+/// Stores the workspace version of `path` as `add` captures it, and returns its value;
+/// `None` when nothing is there.
+pub fn store_workspace_value(
+    root: &Path,
+    path: &str,
+    store: &ContentStore,
+) -> Result<Option<wheat_core::FileValue>> {
+    let max_file_bytes = repository_config::read(root)?.max_file_bytes;
+    Ok(
+        match read_captured(root, path, store, Limits::default(), max_file_bytes)? {
+            None => None,
+            Some(Captured::Stored(value)) => Some(value),
+            Some(Captured::Bytes(file)) => Some(wheat_core::FileValue {
+                content: store.put(&file.bytes)?,
+                kind: file.kind,
+            }),
+        },
+    )
 }
 
 /// Streams a workspace file too long to hold into the store and returns its value. One

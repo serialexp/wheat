@@ -752,13 +752,7 @@ fn phase_one_routine_single_target_workflow_across_processes() {
     // The normal path infers the single conflicted immutable revision from the path.
     let resolved = harness.json_ok(
         &harness.workspace,
-        &[
-            "resolve",
-            "--path",
-            "shared.txt",
-            "--value",
-            "resolved value\n",
-        ],
+        &["resolve", "shared.txt", "--value", "resolved value\n"],
     );
     assert_eq!(resolved["command"], "resolve");
     assert_eq!(

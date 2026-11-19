@@ -142,23 +142,12 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
   change (2026-10-21).** Pull moves every local change above the pulled commits; one
   whose edits are already there (the same fix made in Git) is not dropped as
   `git rebase` would, so the next push projects it as an empty commit. Untested.
-- `[ ]` **Resolving a conflict is awkward.** The workspace shows only one side of a
-  conflicted file, with no markers, and `wheat resolve` takes the whole resolved
-  file as `--value` on the command line (bounded by the argument size limit). After
-  resolving with exactly the content already in the workspace, `wheat materialize`
-  refuses ("changed from its exact observed value") and `status` keeps listing the
-  file as modified until `wheat restore` of that path. Options: resolve from the
-  workspace file, and treat a workspace file equal to the new view's as unchanged.
-  Root causes (2026-10-21): `resolve` publishes a new view but never moves the
-  materialized pin (`add` does, through `capture_settlement::settle`), so `status`
-  compares with the old side; `materialize` refuses only when the bytes match neither
-  side, which `--value "$(cat f)"` causes by stripping the trailing newline; and
-  `restore` then brings back the old side, not the resolution.
-- `[ ]` **Resolving one path of a multi-path conflict drops the rest (2026-10-21).**
-  `resolve_conflict` removes every failed edit of the conflict
-  (`crates/wheat-store/src/repository_mutation.rs:415`, core `repository.rs:963`), and
-  the CLI takes a single `--path`, so the change's edits on its other conflicted paths
-  vanish silently and those files keep the other side's value.
+- `[ ]` **A conflicted file shows only one side.** The workspace holds one side of a
+  conflicted file, with no markers, so the author writes the resolution with nothing
+  to show what the other side did. Since 2026-11-19 `wheat resolve PATH...` reads the
+  resolution from the workspace file and settles the pin as `add` does (so `status`
+  shows it unchanged); what is left is writing both sides, with
+  markers, into the workspace for the author to edit.
 - `[ ]` **Resolution revisions have no author or date (2026-10-21).** They use
   `RevisionMetadata::default()` (`repository_mutation.rs:445`), so `wheat log` shows
   `author  <> 1970-01-01T00:00:00Z`; integrate's combine-by-date order may see it too.

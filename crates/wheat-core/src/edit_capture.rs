@@ -276,6 +276,18 @@ fn canonicalize(snapshot: FileSnapshot<'_>) -> CanonicalSnapshot<'_> {
     }
 }
 
+/// Whether capture treats `snapshot` as guarded text: text, not a symlink or binary, and
+/// within the guarded size and line bounds. A transition is captured as guarded edits
+/// only when both its sides are; otherwise it is a whole-file replacement.
+pub fn is_guarded_text(snapshot: FileSnapshot<'_>, limits: CaptureLimits) -> bool {
+    snapshot.kind != FileKind::Symlink
+        && guarded_text_eligible(
+            &canonicalize(snapshot),
+            limits.guarded,
+            limits.max_guarded_lines,
+        )
+}
+
 fn guarded_text_eligible(
     snapshot: &CanonicalSnapshot<'_>,
     limits: Limits,

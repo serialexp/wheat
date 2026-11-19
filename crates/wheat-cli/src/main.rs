@@ -15,15 +15,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use wheat_core::{
-    ApplicationResultRecord, ChangeId, ContentId, EditFailure, EditTransition, FileKind, FileValue,
-    ObjectId, ProjectedCommit, RepositoryError, RevisionEdits, RevisionId, ViewId,
-    diff_model::DiffLimits, guarded::Limits,
+    ChangeId, ContentId, EditFailure, EditTransition, FileKind, FileValue, ObjectId,
+    ProjectedCommit, RepositoryError, RevisionEdits, RevisionId, ViewId, diff_model::DiffLimits,
+    guarded::Limits,
 };
 use wheat_store::{
-    ApplicationMapStore, Arrival, BatchObjectStore, ContentStoreError, ImmutableObjectStore,
-    MergeBudget, MerkleTreeStore, PersistedConflictResolution, PersistedRepositoryMutator,
-    PublicationStore, RepositoryReader, RevisionMapStore, finalize_mutation_publication,
-    prepare_mutation_publication, prepare_mutation_publication_moving_label,
+    Arrival, BatchObjectStore, ContentStoreError, ImmutableObjectStore, MergeBudget,
+    MerkleTreeStore, PersistedConflictResolution, PersistedRepositoryMutator, PublicationStore,
+    RepositoryReader, finalize_mutation_publication, prepare_mutation_publication,
+    prepare_mutation_publication_moving_label,
 };
 mod command_output;
 
@@ -876,18 +876,21 @@ struct NativePublishArgs {
 
 #[derive(Debug, Args)]
 struct ResolveArgs {
-    /// Conflicted immutable revision (advanced disambiguation; inferred from --path when omitted).
-    revision: Option<String>,
-    /// Path whose resolved value should be recorded.
+    /// Conflicted paths, each resolved to its workspace file (a missing file deletes it).
+    /// With none, every path of the conflict. A resolution must cover every path its
+    /// conflict's failed edits wrote.
+    paths: Vec<String>,
+    /// Conflicted revision (inferred from the paths, or the only conflict, when omitted).
     #[arg(long)]
-    path: String,
-    /// Resolved UTF-8 content; omit with --delete.
-    #[arg(long, conflicts_with = "delete", required_unless_present = "delete")]
+    revision: Option<String>,
+    /// Resolved UTF-8 content for the one named path, in place of its workspace file.
+    #[arg(long, conflicts_with = "delete")]
     value: Option<String>,
-    /// Resolved file kind (defaults to the target tree's existing kind, or regular for a new path).
+    /// Resolved file kind with --value (defaults to the target tree's existing kind, or
+    /// regular for a new path).
     #[arg(long, value_enum, conflicts_with = "delete")]
     kind: Option<CliFileKind>,
-    /// Resolve by deleting the path.
+    /// Resolve the one named path by deleting it.
     #[arg(long)]
     delete: bool,
 }
@@ -2647,9 +2650,19 @@ fn resolve(
     store_root: &std::path::Path,
     arguments: ResolveArgs,
 ) -> Result<Success> {
-    if arguments.path.len() > conflict_inspection::MAX_PATH_BYTES {
+    if arguments
+        .paths
+        .iter()
+        .any(|path| path.len() > conflict_inspection::MAX_PATH_BYTES)
+    {
         return Err(CliFailure::limit(
             "resolution path exceeds conflict inspection limit",
+        ));
+    }
+    let given_value = arguments.value.is_some() || arguments.delete || arguments.kind.is_some();
+    if given_value && arguments.paths.len() != 1 {
+        return Err(CliFailure::invalid(
+            "--value, --kind and --delete resolve exactly one named path",
         ));
     }
     let local = open(store_root)?;
@@ -2657,95 +2670,67 @@ fn resolve(
     let _workspace_lock = materialization::WorkspaceLock::acquire(workspace_root)?;
     let mut metadata = WorkspaceMetadata::read(workspace_root)?;
     let runtime = runtime()?;
-    let revision = if let Some(revision) = arguments.revision.as_deref() {
-        RevisionId::from_str(revision).map_err(|_| CliFailure::invalid("invalid revision ID"))?
+    let document = runtime.block_on(conflict_inspection::inspect(
+        &local,
+        metadata.effective_view(),
+    ))?;
+    let conflict = choose_conflict(
+        document.conflicts,
+        arguments.revision.as_deref(),
+        &arguments.paths,
+    )?;
+    let conflict_paths = conflict
+        .edits
+        .iter()
+        .map(|edit| edit.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let paths = if arguments.paths.is_empty() {
+        conflict_paths.clone()
     } else {
-        let document = runtime.block_on(conflict_inspection::inspect(
-            &local,
-            metadata.effective_view(),
-        ))?;
-        let mut matches = std::collections::BTreeSet::new();
-        for conflict in document.conflicts {
-            if conflict
-                .edits
-                .iter()
-                .any(|edit| edit.path == arguments.path)
-            {
-                matches.insert(conflict.revision_id);
-            }
-        }
-        match matches.len() {
-            1 => matches.into_iter().next().expect("one matching revision"),
-            0 => {
-                return Err(CliFailure::conflict(
-                    "no current conflicted revision affects the requested path",
-                ));
-            }
-            _ => {
-                return Err(CliFailure::conflict(
-                    "multiple current conflicted revisions affect the requested path; specify a revision ID",
-                ));
-            }
-        }
+        arguments.paths.iter().cloned().collect()
     };
+    if let Some(outside) = paths.iter().find(|path| !conflict_paths.contains(*path)) {
+        return Err(CliFailure::conflict(format!(
+            "{outside} is not conflicted in revision {}",
+            conflict.revision_id
+        )));
+    }
     let expected = local.heads.read()?;
     let objects = BatchObjectStore::new(&local.objects, 1024, 8 * 1024 * 1024);
-    let reader = RepositoryReader::new(&objects, &local.content);
-    let (application_id, existing) = runtime.block_on(async {
-        let working = reader.view(metadata.effective_view()).await?;
-        let record = reader.revision(revision).await?;
-        let current = RevisionMapStore::new(&objects)
-            .get(working.revisions, record.change_id)
-            .await?;
-        if current != Some(revision) {
-            return Err(CliFailure::conflict(
-                "revision is not the current conflicted application",
-            ));
-        }
-        let application_id = ApplicationMapStore::new(&objects)
-            .get(working.applications, record.change_id)
-            .await?
-            .context("revision is not the current conflicted application")?;
-        let application = reader.application(application_id).await?;
-        if application.revision_id != revision
-            || !matches!(
-                application.result,
-                ApplicationResultRecord::Conflicted { .. }
-            )
-        {
-            return Err(CliFailure::conflict(
-                "revision is not the current conflicted application",
-            ));
-        }
-        let target = reader.view(application.target_view).await?;
-        let components = arguments
-            .path
-            .split('/')
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let existing = MerkleTreeStore::new(&objects)
-            .lookup(target.tree, &components)
-            .await?;
-        Ok::<_, anyhow::Error>((application_id, existing))
-    })?;
     // Store/authenticate content before metadata referring to it is prepared.
-    let value = match arguments.value {
-        Some(value) => {
-            let kind = arguments
-                .kind
-                .map(Into::into)
-                .or_else(|| existing.map(|value| value.kind))
-                .unwrap_or(FileKind::Regular);
-            let content = put_captured_value(&local.content, &value, kind)?;
-            Some(FileValue { content, kind })
+    let mut resolved = std::collections::BTreeMap::new();
+    if given_value {
+        let path = arguments.paths[0].clone();
+        let value = match arguments.value {
+            Some(value) => {
+                let kind = match arguments.kind {
+                    Some(kind) => kind.into(),
+                    None => runtime
+                        .block_on(target_kind(&objects, &local.content, &conflict, &path))?
+                        .unwrap_or(FileKind::Regular),
+                };
+                let content = put_captured_value(&local.content, &value, kind)?;
+                Some(FileValue { content, kind })
+            }
+            None if arguments.delete => None,
+            None => return Err(CliFailure::invalid("--kind needs --value")),
+        };
+        resolved.insert(path, value);
+    } else {
+        for path in paths {
+            let value = wheat_client::workspace::store_workspace_value(
+                workspace_root,
+                &path,
+                &local.content,
+            )?;
+            resolved.insert(path, value);
         }
-        None if arguments.delete => None,
-        None => return Err(CliFailure::invalid("a value or --delete is required")),
-    };
+    }
+    let resolved_paths = resolved.keys().cloned().collect::<Vec<_>>();
     let resolution = PersistedConflictResolution {
-        conflict_revision: revision,
-        application: application_id,
-        resolved: std::collections::BTreeMap::from([(arguments.path, value)]),
+        conflict_revision: conflict.revision_id,
+        application: conflict.application_id,
+        resolved,
     };
     let mutator = PersistedRepositoryMutator::new(&objects, &local.content, &local.heads);
     let (prepared, outcome) = runtime.block_on(mutator.resolve_conflict(
@@ -2762,6 +2747,26 @@ fn resolve(
         expected,
         prepared,
     ))?;
+    // The resolved paths the workspace holds as the resolution has them are settled into
+    // the materialized pin, as `add` settles what it captures, so `status` doesn't show
+    // them changed. Settled before anything is published; its tree nodes join the batch
+    // flushed below.
+    let settlement = metadata
+        .materialized
+        .as_ref()
+        .map(|pinned| {
+            runtime.block_on(wheat_client::capture_settlement::settle(
+                workspace_root,
+                &objects,
+                &local.content,
+                pinned,
+                publication.proposed(),
+                resulting_frontier,
+                conflict.change_id,
+                &resolved_paths,
+            ))
+        })
+        .transpose()?;
     metadata.pending_repository_operation = Some(PendingRepositoryOperation {
         expected_head: publication.expected().into(),
         proposed_head: publication.proposed().into(),
@@ -2769,7 +2774,18 @@ fn resolve(
         selected_change: metadata.selected_change,
         rebinds: false,
     });
-    workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?;
+    match &settlement {
+        // Root the settled pin before metadata can reference it.
+        Some(settlement) => workspace_registry_service::transition_materialization(
+            workspace_root,
+            store_root,
+            &metadata,
+            settlement.materialized.repository_head.into(),
+            settlement.materialized.view,
+            settlement.materialized.tree,
+        )?,
+        None => workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?,
+    }
     metadata
         .replace_prepared(workspace_root)?
         .publish()
@@ -2779,19 +2795,30 @@ fn resolve(
     metadata.selected_frontier =
         (resulting_frontier != metadata.basis).then_some(resulting_frontier);
     metadata.pending_repository_operation = None;
+    if let Some(settlement) = &settlement {
+        metadata.materialized = Some(settlement.materialized.clone());
+    }
     metadata
         .replace_prepared(workspace_root)?
         .publish()
         .map_err(|error| anyhow::anyhow!(error))?;
     workspace_registry_service::reconcile(workspace_root, store_root, &metadata)?;
+    let materialize_required = settlement.as_ref().is_none_or(|settled| !settled.complete);
     let mut output = String::new();
     writeln!(output, "revision {}", outcome.revision_id)?;
     print_reapplied(&mut output, &outcome.reapplied)?;
+    if materialize_required {
+        writeln!(
+            output,
+            "the working view differs from the workspace; run `wheat materialize` to update it"
+        )?;
+    }
     Success::new(
         "resolve",
         json!({
             "revision": outcome.revision_id.to_string(),
             "reapplied": outcome.reapplied.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "materialize_required": materialize_required,
         }),
         output,
     )
@@ -2876,6 +2903,61 @@ fn capture_initial_edit(
         },
         edits: captured.edits,
     })
+}
+
+/// The conflict `resolve` works on: the one `revision` names, else the one whose failed
+/// edits wrote any of `paths`, else the only one.
+fn choose_conflict(
+    conflicts: Vec<conflict_inspection::ConflictEntry>,
+    revision: Option<&str>,
+    paths: &[String],
+) -> Result<conflict_inspection::ConflictEntry> {
+    if let Some(revision) = revision {
+        let revision = RevisionId::from_str(revision)
+            .map_err(|_| CliFailure::invalid("invalid revision ID"))?;
+        return conflicts
+            .into_iter()
+            .find(|conflict| conflict.revision_id == revision)
+            .ok_or_else(|| {
+                CliFailure::conflict("revision is not the current conflicted application")
+            });
+    }
+    let mut matching = conflicts
+        .into_iter()
+        .filter(|conflict| {
+            paths.is_empty() || conflict.edits.iter().any(|edit| paths.contains(&edit.path))
+        })
+        .collect::<Vec<_>>();
+    match (matching.len(), paths.is_empty()) {
+        (1, _) => Ok(matching.pop().expect("one matching conflict")),
+        (0, true) => Err(CliFailure::conflict("there is no conflict to resolve")),
+        (0, false) => Err(CliFailure::conflict(
+            "no current conflicted revision affects the requested path",
+        )),
+        (_, true) => Err(CliFailure::conflict(
+            "several revisions are conflicted; name a path or --revision",
+        )),
+        (_, false) => Err(CliFailure::conflict(
+            "multiple current conflicted revisions affect the requested paths; specify --revision",
+        )),
+    }
+}
+
+/// The kind `path` has in the tree the conflicted revision was applied to.
+async fn target_kind(
+    objects: &impl ImmutableObjectStore,
+    content: &wheat_store::ContentStore,
+    conflict: &conflict_inspection::ConflictEntry,
+    path: &str,
+) -> Result<Option<FileKind>> {
+    let reader = RepositoryReader::new(objects, content);
+    let application = reader.application(conflict.application_id).await?;
+    let target = reader.view(application.target_view).await?;
+    let components = path.split('/').map(str::to_owned).collect::<Vec<_>>();
+    Ok(MerkleTreeStore::new(objects)
+        .lookup(target.tree, &components)
+        .await?
+        .map(|value| value.kind))
 }
 
 fn put_captured_value(

@@ -402,7 +402,7 @@ fn pull_takes_a_resolution_of_a_conflict_the_label_holds() {
         reader,
         reader_stores,
         config,
-        &["resolve", "--path", "same.txt", "--value", "settled"],
+        &["resolve", "same.txt", "--value", "settled"],
     );
     change(&sides.writer, config, "more.txt", "more");
     ok(writer, writer_stores, config, &["publish"]);
@@ -432,6 +432,68 @@ fn pull_takes_a_resolution_of_a_conflict_the_label_holds() {
     assert_eq!(frontier_count(&sides.reader, config), 0);
     ok(reader, reader_stores, config, &["validate"]);
     ok(reader, reader_stores, config, &["publish"]);
+}
+
+/// A joined change whose failed edits wrote two paths is resolved from the workspace
+/// files, both at once: naming only one is refused, saying which is left.
+#[test]
+fn a_conflict_on_two_paths_resolves_from_the_workspace() {
+    let (sides, _server) = sides();
+    let config = &sides.config;
+    let (writer, writer_stores) = &sides.writer;
+    let (reader, stores) = &sides.reader;
+    change(&sides.writer, config, "x", "remote");
+    change(&sides.writer, config, "y", "remote");
+    ok(writer, writer_stores, config, &["publish", "--keep-label"]);
+    // One local change creating both.
+    change(&sides.reader, config, "x", "local");
+    fs::write(reader.join("y"), "local").unwrap();
+    ok(reader, stores, config, &["add", "y"]);
+    ok(reader, stores, config, &["fetch"]);
+    let joined = ok_json(reader, stores, config, &["integrate"]);
+    assert_eq!(
+        joined["conflicted"].as_array().unwrap().len(),
+        1,
+        "{joined}"
+    );
+    let conflicts = ok_json(reader, stores, config, &["conflicts"]);
+    let mut paths = conflicts["conflicts"][0]["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edit| edit["path"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths, ["x", "y"], "{conflicts}");
+
+    let partial = remote_support::fails_json(
+        reader,
+        stores,
+        config,
+        &["resolve", "x", "--value", "settled"],
+    );
+    assert_eq!(
+        partial["error"]["code"], "invalid_conflict_resolution",
+        "{partial}"
+    );
+    assert!(
+        partial["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("unresolved: y"),
+        "{partial}"
+    );
+
+    fs::write(reader.join("x"), "settled").unwrap();
+    fs::remove_file(reader.join("y")).unwrap();
+    ok(reader, stores, config, &["resolve"]);
+
+    let conflicts = ok_json(reader, stores, config, &["conflicts"]);
+    assert_eq!(conflicts["conflicts"], serde_json::json!([]), "{conflicts}");
+    // The working view holds x as written and no y, as the workspace does.
+    let status = ok_json(reader, stores, config, &["status"]);
+    assert_eq!(status["changes"], serde_json::json!([]), "{status}");
+    ok(reader, stores, config, &["validate"]);
 }
 
 /// A pull whose integrate is refused keeps the fetch and says what to run next.

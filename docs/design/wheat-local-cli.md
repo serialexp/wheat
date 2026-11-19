@@ -2,7 +2,7 @@
 
 Status: partial — the Phase 1 local workflow is implemented and accepted; Phase 2 labels/frontiers, workspace registry, ignore rules, `add --all`, and explicit revision collapse are landed; extended configuration keys are stored but not yet read; dependency/integration workflow, lifecycle tooling, and Phases 2–3 remain outstanding
 Owner: bart
-Last updated: 2026-11-08
+Last updated: 2026-11-19
 
 ## Implementation status
 
@@ -26,6 +26,11 @@ both lists.
   expose retained edit/application evidence and publish exact resolutions. Routine
   resolution infers the unique conflicted revision from its selected path; an
   explicit immutable revision remains available only for disambiguation.
+  `wheat resolve [PATH...]` (2026-11-19) takes each path's resolution from its
+  workspace file (a missing file deletes it), every path of the conflict when none is
+  named, and settles the resolved paths into the materialized pin as `add` does; a
+  resolution must cover every path the conflict's failed edits wrote, since all of
+  them are replaced. `--value`/`--kind`/`--delete` resolve one named path instead.
 - [x] **Git bootstrap and publication compatibility.** `wheat import` accepts a
   local Git repository or temporary-mirrors a Git URL into a fresh packed Wheat
   repository; `wheat push` projects a selected clean native view and publishes

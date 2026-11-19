@@ -241,7 +241,6 @@ pub fn run(
         &workspace,
         &[
             "resolve",
-            "--path",
             &conflict_path,
             "--value",
             "Wheat profile resolved value\n",

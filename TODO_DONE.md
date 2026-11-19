@@ -215,6 +215,25 @@ Finished items, moved here from `TODO.md` under the same headings.
 
 ## Found while dogfooding (2026-10-19)
 
+- `[x]` **Resolving one path of a multi-path conflict drops the rest (2026-10-21).**
+  Fixed 2026-11-19. Keeping a path's failed edit for later can't work: a revision's own
+  edits must apply where it sits. So a resolution must now name every path the
+  conflict's failed edits wrote (`wheat_core::check_resolved_paths`, in core's
+  reference and the store's mutator alike), and one that leaves a path out is refused
+  with `UnresolvedConflictPaths` naming it. Bart chose (2026-11-19) that `wheat resolve
+  [PATH...]` takes each resolution from the workspace file (a missing file deletes it),
+  every path of the conflict when none is named, `--revision` as a flag, and
+  `--value`/`--kind`/`--delete` for one named path. It settles the resolved paths into
+  the materialized pin as `add` does. Tests: store `repository_mutation.rs`
+  `a_resolution_must_name_every_conflicted_path`, CLI `integrate.rs`
+  `a_conflict_on_two_paths_resolves_from_the_workspace`.
+- `[x]` **Adding a binary file a change before made was an internal error (found
+  2026-11-19).** `add` normalized it as guarded text when the authored, baseline and
+  workspace values were all regular files, and failed with `Guarded(NulByte)`. It now
+  normalizes only when all three are guarded text (`edit_capture::is_guarded_text`),
+  and otherwise captures a whole-file transition. Test: `local_workflow.rs`
+  `a_binary_file_from_an_earlier_change_adds_to_a_later_one`.
+
 - `[x]` **A native pull or fetch without `remote.meta` is an internal error
   (2026-10-21).** Fixed 2026-10-29: `resolve_remote` refuses with `invalid_input` and
   advice that works: `wheat publish --remote <url>` (which already starts tracking a
