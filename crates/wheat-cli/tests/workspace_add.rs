@@ -423,7 +423,10 @@ fn add_recovers_pending_restore_before_capturing_workspace_bytes() {
     assert!(!interrupted.status.success());
     assert!(dir.path().join(".wheat/materialization.json").exists());
 
-    let added = ok(
+    // The add finishes the restore first, so it captures the restored file, which is
+    // what the change has: nothing to add. Capturing the discarded bytes would have
+    // made a revision.
+    let added = wheat(
         dir.path(),
         &[
             "add",
@@ -434,9 +437,11 @@ fn add_recovers_pending_restore_before_capturing_workspace_bytes() {
             "file",
         ],
     );
-    ok(
-        dir.path(),
-        &["edits", "--revision", &field(&added, "revision")],
+    assert!(!added.status.success());
+    assert!(
+        String::from_utf8_lossy(&added.stderr).contains("nothing to add"),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
     );
     assert_eq!(
         fs::read(dir.path().join("file")).unwrap(),

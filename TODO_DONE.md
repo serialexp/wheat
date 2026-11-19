@@ -243,6 +243,22 @@ Finished items, moved here from `TODO.md` under the same headings.
   given metadata), CLI `integrate.rs`
   `a_conflict_on_two_paths_resolves_from_the_workspace` (`wheat log` shows the actor,
   message and dates).
+- `[x]` **`wheat add <directory>` adds nothing (2026-10-20).** It reported "added 1
+  path(s)" and published a revision with only the predecessor's edits; any add that
+  changed nothing published one; the count was of arguments; and `wheat add .` /
+  `wheat add many/` failed as an internal error. Fixed 2026-11-19, choosing (Bart did
+  not answer the question, so this is open to revisit) to take a directory as `git
+  add` does: `authoring::expand_listed` turns a named directory (`.` for the whole
+  workspace, a trailing `/` allowed) into its changed and deleted tracked files, from
+  a scan filtered to it, and its untracked files no ignore rule covers, from
+  `workspace_walk::walk_below`. A missing path is a deleted file or directory of the
+  tree or is refused; an invalid one is invalid input. An untracked `.git` (file or
+  directory, any case) is treated as ignored by the walk, so neither `status` nor a
+  directory add lists Git's own files. `Authored::changed` names the paths whose
+  edits the revision changes: an add that changes none is refused with "nothing to
+  add", and "added N path(s)" counts them. Tests: `workspace_add_all.rs` (directory,
+  `.` beside `.git`, deleted directory, refusals, count); `active_changes.rs` and
+  `workspace_add.rs` tests that relied on a no-op add now expect the refusal.
 - `[x]` **`wheat push --force-with-lease` counts every exported commit as pushed.**
   Its report said "pushed N commits" for the whole exported chain, not the commits the
   remote lacked. Fixed 2026-11-19: when the remote's tip doesn't anchor the export and

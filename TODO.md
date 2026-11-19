@@ -145,15 +145,13 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
   resolution from the workspace file and settles the pin as `add` does (so `status`
   shows it unchanged); what is left is writing both sides, with
   markers, into the workspace for the author to edit.
-- `[ ]` **`wheat add <directory>` adds nothing (2026-10-20).** With `many/00/1.txt`
-  and `many/00/2.txt` untracked, `wheat add many` reports "added 1 path(s)" and makes
-  a revision, but `status` still lists every file under `many/` as untracked. Either
-  add the directory's files or refuse a directory by name. Found with it
-  (2026-10-21): the revision holds only the predecessor's edits (`preserved=1
-  added=0`); any add that changes nothing (a missing path, an unchanged file) still
-  publishes a revision; "added N path(s)" counts the arguments, not captured paths;
-  and `wheat add .` / `wheat add many/` fail as an internal error (`invalid directory
-  component`), because `lookup_many` runs before the paths are validated.
+- `[ ]` **A path-filtered workspace scan reads the whole tracked tree (found
+  2026-11-19).** `workspace_scan::scan_locked` walks every file of the materialized
+  tree (`walk_files`) and only then applies its `TreePathFilter`, so `wheat diff
+  <path>` and `wheat add <directory>` read as many tree objects as a full `status`. A
+  filtered `walk_files` that skips directories no root can hold would make them cost
+  what is below the paths; `tracked_paths` would then hold only those, which every
+  caller would have to allow for.
 - `[ ]` **`wheat log` lists changes in ChangeId order.** For imported history the
   IDs are UUIDv5, so the log is in effectively random order, and it prints every
   change with its whole message, with no limit or paging. Order by the view's

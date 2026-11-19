@@ -601,7 +601,7 @@ fn change_revise_is_rejected_and_add_help_requires_explicit_paths() {
     let add_help = String::from_utf8_lossy(&add_help.stdout);
     assert!(add_help.contains("--change"));
     assert!(!add_help.contains("--predecessor"));
-    assert!(add_help.contains("Explicit repository-relative workspace paths"));
+    assert!(add_help.contains("Repository-relative workspace paths"));
 }
 
 /// Content past `cat`'s output limit is refused with a pointer to `--no-limit`, which

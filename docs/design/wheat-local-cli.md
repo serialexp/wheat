@@ -207,7 +207,12 @@ both lists.
   require `--include-untracked` or explicit path arguments. Depends on the
   completed ignore rules. (2026-09-25: `wheat add --all` landed with tests in
   `crates/wheat-cli/tests/workspace_add_all.rs`. `--include-untracked` does not
-  exist yet; untracked files can only be added by naming them.)
+  exist yet; untracked files can only be added by naming them.) 2026-11-19: a named
+  directory (`.` for the whole workspace) takes, as `git add` does, its changed and
+  deleted tracked files and its untracked files no ignore rule covers, never what is
+  in `.git`; the walk (and so `status`) treats an untracked `.git` as ignored. An add
+  that would change nothing, or names a path that matches nothing, is refused rather
+  than publishing a revision, and "added N path(s)" counts the paths that changed.
 - [ ] **Phase 2 — lifecycle tooling.** Choose and implement the contract for
   formatters, linters, policy checks, and notifications around capture, revision,
   materialization, and publication. The design is settled in

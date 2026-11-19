@@ -84,6 +84,22 @@ pub fn walk_workspace(
     ignore_stack: &mut IgnoreStack,
     limits: WalkLimits,
 ) -> anyhow::Result<WorkspaceWalkResult> {
+    Ok(
+        walk_below(workspace_root, tracked_paths, ignore_stack, limits, "")?
+            .expect("the workspace root is never ignored"),
+    )
+}
+
+/// Like [`walk_workspace`], for the entries below `directory` (a `/`-separated
+/// repository path, `""` for the root) only, under the ignore rules of the directories
+/// above it. `None` when `directory` itself is ignored: the walk would never enter it.
+pub fn walk_below(
+    workspace_root: &Path,
+    tracked_paths: &BTreeSet<String>,
+    ignore_stack: &mut IgnoreStack,
+    limits: WalkLimits,
+    directory: &str,
+) -> anyhow::Result<Option<WorkspaceWalkResult>> {
     let tracked_dirs = tracked_directory_prefixes(tracked_paths);
     let mut state = WalkState {
         tracked_paths,
@@ -95,18 +111,55 @@ pub fn walk_workspace(
         truncated: false,
     };
 
+    // Enter each directory down to `directory` as the walk would, with the rules each
+    // one adds, stopping where the walk would not go on.
     ignore_stack.push_directory(workspace_root);
-    walk_directory(workspace_root, &String::new(), 0, ignore_stack, &mut state);
-    ignore_stack.pop_directory();
+    let mut entered = 1;
+    let mut path = workspace_root.to_path_buf();
+    let mut prefix = String::new();
+    let mut depth = 0;
+    let mut ignored = false;
+    for component in directory.split('/').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        path.push(component);
+        if !state.tracked_dirs.contains(&prefix)
+            && (is_git_control(component) || ignore_stack.is_ignored(&prefix, true).is_ignored())
+        {
+            ignored = true;
+            break;
+        }
+        ignore_stack.push_directory(&path);
+        entered += 1;
+        depth += 1;
+    }
+    if !ignored {
+        walk_directory(&path, &prefix, depth, ignore_stack, &mut state);
+    }
+    for _ in 0..entered {
+        ignore_stack.pop_directory();
+    }
+    if ignored {
+        return Ok(None);
+    }
 
-    Ok(WorkspaceWalkResult {
+    Ok(Some(WorkspaceWalkResult {
         untracked: {
             state.untracked.sort_by(|a, b| a.path.cmp(&b.path));
             state.untracked
         },
         gitignore_fallback_used: !ignore_stack.gitignore_fallbacks().is_empty(),
         truncated: state.truncated,
-    })
+    }))
+}
+
+/// Whether an entry named `name` is Git's own: a repository's `.git` directory, or the
+/// `.git` file a worktree or submodule has instead. Like Git, the walk never lists
+/// what is inside one as untracked, in any letter case (see [`crate::dot_git`]).
+fn is_git_control(name: &str) -> bool {
+    name.eq_ignore_ascii_case(".git")
 }
 
 /// Mutable walk state shared across recursive calls.
@@ -180,35 +233,38 @@ fn walk_directory(
         };
 
         if file_type.is_dir() {
-            match ignore_stack.is_ignored(&relative_path, true) {
-                IgnoreMatch::Ignored { .. } => {
-                    // Prune: don't descend into ignored directories.
-                    if !state.tracked_dirs.contains(&relative_path) {
-                        state.untracked.push(UntrackedEntry {
-                            path: relative_path,
-                            classification: UntrackedClassification::Ignored,
-                            is_directory: true,
-                        });
-                    }
+            let ignored =
+                is_git_control(&name) || ignore_stack.is_ignored(&relative_path, true).is_ignored();
+            if ignored {
+                // Prune: don't descend into ignored directories.
+                if !state.tracked_dirs.contains(&relative_path) {
+                    state.untracked.push(UntrackedEntry {
+                        path: relative_path,
+                        classification: UntrackedClassification::Ignored,
+                        is_directory: true,
+                    });
                 }
-                _ => {
-                    if !state.tracked_dirs.contains(&relative_path) {
-                        state.untracked.push(UntrackedEntry {
-                            path: relative_path.clone(),
-                            classification: UntrackedClassification::Untracked,
-                            is_directory: true,
-                        });
-                    }
-                    subdirs.push((entry.path(), relative_path));
+            } else {
+                if !state.tracked_dirs.contains(&relative_path) {
+                    state.untracked.push(UntrackedEntry {
+                        path: relative_path.clone(),
+                        classification: UntrackedClassification::Untracked,
+                        is_directory: true,
+                    });
                 }
+                subdirs.push((entry.path(), relative_path));
             }
         } else {
             if state.tracked_paths.contains(&relative_path) {
                 continue;
             }
-            let classification = match ignore_stack.is_ignored(&relative_path, false) {
-                IgnoreMatch::Ignored { .. } => UntrackedClassification::Ignored,
-                _ => UntrackedClassification::Untracked,
+            let classification = if is_git_control(&name) {
+                UntrackedClassification::Ignored
+            } else {
+                match ignore_stack.is_ignored(&relative_path, false) {
+                    IgnoreMatch::Ignored { .. } => UntrackedClassification::Ignored,
+                    _ => UntrackedClassification::Untracked,
+                }
             };
             state.untracked.push(UntrackedEntry {
                 path: relative_path,

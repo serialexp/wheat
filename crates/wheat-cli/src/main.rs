@@ -638,11 +638,14 @@ struct AddArgs {
     #[arg(long, hide = true)]
     predecessor: Option<String>,
     /// Capture all non-ignored modified and deleted tracked paths instead of
-    /// naming them explicitly. New untracked files are excluded; use explicit
-    /// path arguments to include them.
+    /// naming them explicitly. New untracked files are excluded; name them, or a
+    /// directory holding them, to include them.
     #[arg(long)]
     all: bool,
-    /// Explicit repository-relative workspace paths. Required unless --all is used.
+    /// Repository-relative workspace paths. Required unless --all is used. A directory
+    /// (`.` for the whole workspace) takes, as `git add` does, its changed and deleted
+    /// tracked files and its untracked files no ignore rule covers, never what is in
+    /// `.git`.
     paths: Vec<String>,
     #[command(flatten)]
     metadata: RevisionMetadataArgs,

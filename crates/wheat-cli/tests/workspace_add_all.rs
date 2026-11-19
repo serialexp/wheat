@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
-//! Integration tests for `wheat add --all` workspace-wide capture.
+//! Integration tests for `wheat add --all` workspace-wide capture, and for adding a
+//! directory.
 
 use std::{
     fs,
@@ -241,4 +242,148 @@ fn add_without_all_or_paths_fails() {
         !output.status.success(),
         "add with no paths and no --all should fail"
     );
+}
+
+/// The untracked paths `status` lists, and the ignored ones.
+fn untracked(h: &Harness) -> (Vec<String>, Vec<String>) {
+    let status = h.json_ok(&h.workspace, &["status"]);
+    let mut untracked = Vec::new();
+    let mut ignored = Vec::new();
+    for entry in status["result"]["untracked"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let path = entry["path"].as_str().unwrap().to_owned();
+        if entry["ignored"].as_bool().unwrap() {
+            ignored.push(path);
+        } else {
+            untracked.push(path);
+        }
+    }
+    (untracked, ignored)
+}
+
+fn changed(h: &Harness) -> Vec<String> {
+    let status = h.json_ok(&h.workspace, &["status"]);
+    status["result"]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["path"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn adding_a_directory_takes_its_changed_deleted_and_new_files() {
+    let h = Harness::new();
+    h.init_from_git(&[
+        ("src/main.rs", "fn main() {}\n"),
+        ("src/lib.rs", "pub fn hello() {}\n"),
+        ("src/old.rs", "// old\n"),
+        ("docs/a.md", "a\n"),
+        ("README.md", "# Project\n"),
+    ]);
+    h.ok(&h.workspace, &["change", "new", "-m", "work in src"]);
+    fs::write(h.workspace.join(".wheatignore"), "*.log\n").unwrap();
+    fs::write(h.workspace.join("src/main.rs"), "fn main() { run() }\n").unwrap();
+    fs::remove_file(h.workspace.join("src/old.rs")).unwrap();
+    fs::write(h.workspace.join("src/new.rs"), "// new\n").unwrap();
+    fs::create_dir(h.workspace.join("src/deep")).unwrap();
+    fs::write(h.workspace.join("src/deep/x.rs"), "// x\n").unwrap();
+    fs::write(h.workspace.join("src/build.log"), "noise\n").unwrap();
+    fs::write(h.workspace.join("README.md"), "# Changed\n").unwrap();
+    fs::write(h.workspace.join("docs/b.md"), "b\n").unwrap();
+
+    let added = h.json_ok(&h.workspace, &["add", "src/"]);
+    assert_eq!(added["result"]["paths"], 4, "{added}");
+
+    // Everything outside src, and the ignored file in it, is left as it was.
+    assert_eq!(changed(&h), ["README.md"]);
+    let (untracked, ignored) = untracked(&h);
+    assert_eq!(untracked, [".wheatignore", "docs/b.md"]);
+    assert_eq!(ignored, [".wheat", "src/build.log"]);
+}
+
+#[test]
+fn adding_the_workspace_root_leaves_dot_git_alone() {
+    let h = Harness::new();
+    h.init_from_git(&[("tracked.txt", "hello\n")]);
+    h.ok(&h.workspace, &["change", "new", "-m", "everything"]);
+    // The workspace is also a Git checkout.
+    fs::create_dir_all(h.workspace.join(".git/refs")).unwrap();
+    fs::write(h.workspace.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(h.workspace.join("tracked.txt"), "changed\n").unwrap();
+    fs::write(h.workspace.join("new.txt"), "new\n").unwrap();
+
+    // Before the add, status shows `.git` as ignored and nothing inside it.
+    let (untracked_before, ignored) = untracked(&h);
+    assert_eq!(untracked_before, ["new.txt"]);
+    assert_eq!(ignored, [".git", ".wheat"]);
+
+    let added = h.json_ok(&h.workspace, &["add", "."]);
+    assert_eq!(added["result"]["paths"], 2, "{added}");
+    assert_eq!(changed(&h), [] as [&str; 0]);
+    assert_eq!(untracked(&h).0, [] as [&str; 0]);
+}
+
+#[test]
+fn adding_a_deleted_directory_takes_its_deletions() {
+    let h = Harness::new();
+    h.init_from_git(&[
+        ("gone/one.txt", "1\n"),
+        ("gone/two.txt", "2\n"),
+        ("kept.txt", "kept\n"),
+    ]);
+    h.ok(&h.workspace, &["change", "new", "-m", "remove a directory"]);
+    fs::remove_dir_all(h.workspace.join("gone")).unwrap();
+
+    let added = h.json_ok(&h.workspace, &["add", "gone"]);
+    assert_eq!(added["result"]["paths"], 2, "{added}");
+    assert_eq!(changed(&h), [] as [&str; 0]);
+}
+
+#[test]
+fn an_add_that_changes_nothing_is_refused_without_publishing() {
+    let h = Harness::new();
+    h.init_from_git(&[("tracked.txt", "hello\n"), ("dir/inner.txt", "inner\n")]);
+    h.ok(&h.workspace, &["change", "new", "-m", "nothing yet"]);
+    // An ignored directory's files are left out, as `status` leaves them out.
+    fs::write(h.workspace.join(".wheatignore"), "build/\n").unwrap();
+    fs::create_dir(h.workspace.join("build")).unwrap();
+    fs::write(h.workspace.join("build/out.txt"), "output\n").unwrap();
+    let before = h.json_ok(&h.workspace, &["changes"]);
+
+    for (arguments, message) in [
+        (&["add", "tracked.txt"][..], "nothing to add: change"),
+        (
+            &["add", "dir"][..],
+            "nothing to add: no changed, deleted or untracked file under dir",
+        ),
+        (
+            &["add", "build/"][..],
+            "nothing to add: no changed, deleted or untracked file under build",
+        ),
+        (&["add", "missing.txt"][..], "missing.txt matches no file"),
+        (&["add", "../outside"][..], "invalid workspace path"),
+        (&["add", "dir/../tracked.txt"][..], "invalid workspace path"),
+    ] {
+        let output = h.wheat(&h.workspace, arguments);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+    }
+    assert_eq!(h.json_ok(&h.workspace, &["changes"]), before);
+}
+
+#[test]
+fn added_paths_count_the_paths_that_changed() {
+    let h = Harness::new();
+    h.init_from_git(&[("changed.txt", "a\n"), ("same.txt", "b\n")]);
+    h.ok(&h.workspace, &["change", "new", "-m", "one of two"]);
+    fs::write(h.workspace.join("changed.txt"), "a, changed\n").unwrap();
+
+    let added = h.ok(&h.workspace, &["add", "changed.txt", "same.txt"]);
+    let text = String::from_utf8_lossy(&added.stdout);
+    assert!(text.starts_with("added 1 path(s) to change"), "{text}");
 }

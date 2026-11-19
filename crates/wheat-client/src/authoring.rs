@@ -26,7 +26,7 @@ use crate::{
     rewrite_transaction::StoreOperationGuard,
     selection_recovery, workspace,
     workspace_metadata::{PendingRepositoryOperation, WorkspaceMetadata},
-    workspace_registry_service, workspace_scan,
+    workspace_registry_service, workspace_scan, workspace_walk,
 };
 
 /// Which workspace paths an add captures.
@@ -117,7 +117,9 @@ pub fn add(
             }
             resolved
         }
-        AddPaths::Listed(paths) => paths,
+        AddPaths::Listed(arguments) => {
+            expand_listed(&context.root, &local, &context.workspace, &arguments)?
+        }
     };
 
     let expected = local.heads.read()?;
@@ -174,6 +176,13 @@ pub fn add(
         &request.guards,
         revision_metadata,
     ))?;
+    if authored.changed.is_empty() {
+        return Err(CliFailure::invalid(format!(
+            "nothing to add: change {change} already has what the workspace holds at {}",
+            listed(&paths)
+        )));
+    }
+    let changed = authored.changed.len();
     if !authored.moves.is_empty() {
         confirm_moves(change, &authored.moves)?;
     }
@@ -260,7 +269,7 @@ pub fn add(
         change,
         title,
         revision,
-        paths: paths.len(),
+        paths: changed,
         moves: authored.moves,
         moved: authored
             .moved
@@ -277,6 +286,144 @@ pub fn add(
         materialize_required,
         diverged,
     })
+}
+
+/// The paths `add` captures for `arguments`, which it takes as `git add` does: a file as
+/// it is, whether the workspace still has it or not, and a directory (`.` is the
+/// workspace's root) as each tracked file below it the workspace changed or deleted, and
+/// each untracked file below it no ignore rule covers. Nothing inside `.git` is picked
+/// up by a directory. An argument that names nothing is refused.
+fn expand_listed(
+    root: &Path,
+    local: &crate::local::LocalRepository,
+    workspace: &WorkspaceMetadata,
+    arguments: &[String],
+) -> Result<Vec<String>> {
+    let mut paths = BTreeSet::new();
+    // Directories the workspace has, and paths it doesn't: a deleted file or directory
+    // of the tree, or nothing at all.
+    let mut directories = Vec::new();
+    let mut missing = Vec::new();
+    for argument in arguments {
+        let invalid = || CliFailure::invalid(format!("invalid workspace path {argument:?}"));
+        if argument.is_empty() || argument.starts_with('/') {
+            return Err(invalid());
+        }
+        let path = argument.trim_end_matches('/');
+        if path == "." {
+            directories.push(String::new());
+            continue;
+        }
+        materialization::validate_path(path).map_err(|_| invalid())?;
+        match std::fs::symlink_metadata(root.join(path)) {
+            Ok(metadata) if metadata.is_dir() => directories.push(path.to_owned()),
+            Ok(_) => {
+                paths.insert(path.to_owned());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                missing.push(path.to_owned());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect workspace path {path:?}"));
+            }
+        }
+    }
+    if directories.is_empty() && missing.is_empty() {
+        return Ok(paths.into_iter().collect());
+    }
+
+    let filter = if directories.iter().any(String::is_empty) {
+        TreePathFilter::default()
+    } else {
+        TreePathFilter::new(directories.iter().chain(&missing).cloned())
+    };
+    let scan = workspace_scan::scan_locked(
+        root,
+        local,
+        workspace,
+        0,
+        &filter,
+        workspace_scan::ContentIds::Optional,
+    )?;
+    paths.extend(scan.changes.into_iter().map(|change| change.path));
+    for path in &missing {
+        let below = format!("{path}/");
+        let matched = paths.contains(path)
+            || paths
+                .range(below.clone()..)
+                .next()
+                .is_some_and(|found| found.starts_with(&below));
+        if !matched {
+            return Err(CliFailure::invalid(format!(
+                "{path} matches no file in the workspace or the tree"
+            )));
+        }
+    }
+
+    let global = wheat_ignore::loader::read_global_ignore();
+    let global = global
+        .as_ref()
+        .map(|(content, path)| (content.as_str(), path.clone()));
+    let mut ignore = wheat_ignore::stack::IgnoreStack::new(global, &[]);
+    for directory in &directories {
+        let Some(walk) = workspace_walk::walk_below(
+            root,
+            &scan.tracked_paths,
+            &mut ignore,
+            workspace_walk::WalkLimits::default(),
+            directory,
+        )?
+        else {
+            continue;
+        };
+        if walk.truncated {
+            return Err(CliFailure::limit(format!(
+                "{} holds more than one add walks; name its files or directories below it",
+                if directory.is_empty() {
+                    "the workspace"
+                } else {
+                    directory
+                }
+            )));
+        }
+        paths.extend(
+            walk.untracked
+                .into_iter()
+                .filter(|entry| {
+                    !entry.is_directory
+                        && entry.classification
+                            == workspace_walk::UntrackedClassification::Untracked
+                })
+                .map(|entry| entry.path),
+        );
+    }
+    if paths.is_empty() {
+        return Err(CliFailure::invalid(format!(
+            "nothing to add: no changed, deleted or untracked file under {}",
+            listed(&directories)
+        )));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// `paths` for a message: the first few, then how many more.
+fn listed(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut text = paths
+        .iter()
+        .take(SHOWN)
+        .map(|path| if path.is_empty() { "." } else { path.as_str() })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        text.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    text
 }
 
 pub struct NewChange {

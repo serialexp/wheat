@@ -34,6 +34,9 @@ use crate::{
 /// gives up edits moved into it.
 pub struct Authored {
     pub requests: BTreeMap<ChangeId, RevisionRequest>,
+    /// The paths whose edits in the destination change differ from its predecessor's:
+    /// empty when the workspace holds what the change already has.
+    pub changed: BTreeSet<String>,
     /// One line per move, empty when every edit fits the destination as it is.
     pub moves: Vec<String>,
     pub moved: Vec<MovedEdit>,
@@ -338,6 +341,11 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
             });
         }
     }
+    let changed = added
+        .iter()
+        .map(|id| edits[id].path.clone())
+        .chain(removed.iter().map(|id| old_definitions[id].path.clone()))
+        .collect::<BTreeSet<_>>();
     let destination = RevisionEdits {
         edits,
         transition: EditTransition {
@@ -351,6 +359,7 @@ pub async fn author_from_workspace<O: ImmutableObjectStore, P: PublicationStore>
 
     let mut authored = Authored {
         requests: BTreeMap::new(),
+        changed,
         moves: Vec::new(),
         moved: Vec::new(),
     };

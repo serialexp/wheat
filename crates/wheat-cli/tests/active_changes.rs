@@ -82,7 +82,7 @@ fn selected_change_survives_reopen_and_drives_flagless_add() {
 }
 
 #[test]
-fn explicit_add_to_prior_change_keeps_selection_and_absorbs_descendant_edit() {
+fn explicit_add_to_prior_change_keeps_selection_and_reapplies_descendants() {
     let (root, config) = setup();
     let a = ok(root.path(), config.path(), &["change", "new", "-m", "base"]);
     let a_id = field(&a, "change");
@@ -99,13 +99,28 @@ fn explicit_add_to_prior_change_keeps_selection_and_absorbs_descendant_edit() {
     let b_added = ok(root.path(), config.path(), &["add", "file"]);
     let b_revision = field(&b_added, "revision");
 
-    let corrected = ok(
+    // At a's spot, below b's edit, the file is what a already has: nothing to add.
+    let unchanged = command(
         root.path(),
         config.path(),
         &["add", "--change", &a_id, "file"],
     );
+    assert!(!unchanged.status.success());
+    assert!(
+        String::from_utf8_lossy(&unchanged.stderr)
+            .contains(&format!("nothing to add: change {a_id} already has")),
+        "{}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+
+    fs::write(root.path().join("other"), "for a\n").unwrap();
+    let corrected = ok(
+        root.path(),
+        config.path(),
+        &["add", "--change", &a_id, "other"],
+    );
     let text = String::from_utf8_lossy(&corrected.stdout);
-    assert!(text.contains(&format!("to change {a_id} — base")));
+    assert!(text.contains(&format!("added 1 path(s) to change {a_id} — base")));
     assert!(text.contains(&format!("selected change remains {b_id}")));
     assert!(text.contains(&format!("reapplied {b_id}")));
 
