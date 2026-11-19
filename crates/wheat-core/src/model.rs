@@ -878,5 +878,8 @@ pub struct RepositoryClosure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConflictResolution {
     pub conflict_revision: RevisionId,
-    pub resolved_tree: Tree,
+    /// The value each path the conflict's failed edits wrote takes, `None` deleting it. It
+    /// must name every such path and no other: the failed edits are all replaced, and a
+    /// revision's own edits must apply, so none can be kept for later.
+    pub resolved: BTreeMap<String, Option<FileValue>>,
 }

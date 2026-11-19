@@ -386,19 +386,13 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
     let evidence = conflict.edits.values().next().unwrap();
     assert_eq!(evidence.target, Some(value(&io, "a2")));
     assert_eq!(evidence.reason, EditFailure::ExpectedFileMismatch);
-    let mut resolved = repository
-        .view(application.target_view)
-        .unwrap()
-        .tree
-        .clone();
-    resolved.insert("shared".into(), value(&io, "resolved"));
     let outcome = repository
         .resolve_conflict(
             repository.base_view().id,
             effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
-                resolved_tree: resolved,
+                resolved: [("shared".into(), Some(value(&io, "resolved")))].into(),
             },
             ctx,
         )
@@ -876,19 +870,15 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
         )
         .unwrap();
     effective = revised.resulting_view;
-    let target = repository
-        .conflicted_application(effective, b1.revision_id)
-        .unwrap()
-        .target_view;
-    let mut resolved = repository.view(target).unwrap().tree.clone();
-    resolved.insert("shared".into(), value(&io, "resolved"));
+    let resolved: BTreeMap<String, Option<FileValue>> =
+        [("shared".into(), Some(value(&io, "resolved")))].into();
     let b2 = repository
         .resolve_conflict(
             repository.base_view().id,
             effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
-                resolved_tree: resolved.clone(),
+                resolved: resolved.clone(),
             },
             ctx,
         )
@@ -900,7 +890,7 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
             effective,
             ConflictResolution {
                 conflict_revision: b1.revision_id,
-                resolved_tree: resolved
+                resolved
             },
             ctx
         ),

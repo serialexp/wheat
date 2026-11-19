@@ -131,9 +131,9 @@ pub struct PersistedRepositoryMutator<'a, O, P> {
 
 /// A conflict-resolution intent over the paths whose edits failed in one exact application.
 ///
-/// A missing value deletes the path. Paths omitted from `resolved` retain the conflicted
-/// application's partial-tree value, matching a hydrated resolution tree which changed only the
-/// listed paths.
+/// A missing value deletes the path. It names every path the conflict's failed edits wrote
+/// and no other, as [`wheat_core::check_resolved_paths`] requires: all the failed edits are
+/// replaced, so a path left out would silently take the other side.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedConflictResolution {
     pub conflict_revision: RevisionId,
@@ -435,6 +435,8 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .filter_map(|id| predecessor_edits.get(id))
             .map(|edit| edit.path.as_str())
             .collect::<BTreeSet<_>>();
+        wheat_core::check_resolved_paths(&conflict_paths, &resolution.resolved)?;
+        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
 
         let trees = MerkleTreeStore::new(self.objects);
         let target = reader.view(application.target_view).await?;
@@ -459,9 +461,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         {
             if partial_value == *after_value {
                 continue;
-            }
-            if !conflict_paths.contains(path.as_str()) {
-                return Err(RepositoryError::InvalidConflictResolution.into());
             }
             // A file past the guarded bound on either side changes as a whole, as capture would
             // record it, without being read: the target tree's value is already stored, and the
@@ -536,7 +535,6 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         captured_content.commit().map_err(content_error)?;
 
-        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
         let preserved = predecessor_edits
             .keys()
             .filter(|id| !removed.contains(id))
@@ -551,10 +549,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             transition: EditTransition {
                 preserved,
                 added: replacement_edits.clone(),
-                removed,
+                removed: removed.clone(),
                 resolutions: vec![ConflictResolutionEvidence {
                     application: resolution.application,
-                    conflicted_edits: conflict.edits.keys().copied().collect(),
+                    conflicted_edits: removed,
                     replacement_edits,
                 }],
                 ..EditTransition::default()

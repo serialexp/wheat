@@ -101,6 +101,8 @@ pub enum RepositoryError {
     NotConflicted(RevisionId),
     #[error("conflict resolution changed a path outside the conflict")]
     InvalidConflictResolution,
+    #[error("conflict resolution leaves conflicted paths unresolved: {}", .0.join(", "))]
+    UnresolvedConflictPaths(Vec<String>),
     #[error("repository state violates an identity invariant: {0}")]
     InvalidRepositoryState(&'static str),
 }
@@ -902,13 +904,14 @@ impl Repository {
             .filter_map(|id| revision.edits().get(id))
             .map(|edit| edit.path.as_str())
             .collect::<BTreeSet<_>>();
-        let changed_paths = changed_paths(partial_tree, &resolution.resolved_tree);
-        if changed_paths
+        check_resolved_paths(&conflict_paths, &resolution.resolved)?;
+        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
+        let changed_paths = resolution
+            .resolved
             .iter()
-            .any(|path| !conflict_paths.contains(path.as_str()))
-        {
-            return Err(RepositoryError::InvalidConflictResolution);
-        }
+            .filter(|(path, value)| partial_tree.get(*path) != value.as_ref())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
 
         let target = self.views[&application.target_view].clone();
         let mut edits = BTreeMap::new();
@@ -917,7 +920,7 @@ impl Repository {
         let capture_error = |error| RepositoryError::EditApplication(format!("capture: {error:?}"));
         for path in changed_paths {
             let before_value = target.tree.get(&path).copied();
-            let after_value = resolution.resolved_tree.get(&path).copied();
+            let after_value = resolution.resolved[&path];
             // A file past the guarded bound on either side changes as a whole, unread.
             let past_bound = |value: Option<crate::FileValue>| -> Result<bool, RepositoryError> {
                 Ok(match value {
@@ -992,7 +995,6 @@ impl Repository {
                 .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
         }
         let replacement_edits = edits.keys().copied().collect::<BTreeSet<_>>();
-        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
         let preserved = revision
             .edits()
             .keys()
@@ -1006,11 +1008,11 @@ impl Repository {
             edits: revision_edit_records,
             transition: crate::EditTransition {
                 preserved,
-                removed,
+                removed: removed.clone(),
                 added: replacement_edits.clone(),
                 resolutions: vec![crate::ConflictResolutionEvidence {
                     application: application.id,
-                    conflicted_edits: conflict.edits.keys().copied().collect(),
+                    conflicted_edits: removed,
                     replacement_edits,
                 }],
                 ..crate::EditTransition::default()
@@ -1447,6 +1449,30 @@ fn single_outcome(outcome: RevisionsOutcome, change: ChangeId) -> RevisionOutcom
     }
 }
 
+/// A resolution names exactly the paths the conflict's failed edits wrote. Every failed
+/// edit is replaced, and a revision's own edits must apply where it sits, so a failed
+/// edit can't be kept for later: a path left out would silently take the other side.
+pub fn check_resolved_paths<V>(
+    conflict_paths: &BTreeSet<&str>,
+    resolved: &BTreeMap<String, V>,
+) -> Result<(), RepositoryError> {
+    if resolved
+        .keys()
+        .any(|path| !conflict_paths.contains(path.as_str()))
+    {
+        return Err(RepositoryError::InvalidConflictResolution);
+    }
+    let unresolved = conflict_paths
+        .iter()
+        .filter(|path| !resolved.contains_key(**path))
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        return Err(RepositoryError::UnresolvedConflictPaths(unresolved));
+    }
+    Ok(())
+}
+
 fn insert_tree_object(objects: &mut BTreeMap<ObjectId, Vec<u8>>, tree: &Tree) {
     for (id, bytes) in crate::wire::tree_objects(tree).1 {
         insert_canonical_object(objects, id, bytes);
@@ -1464,13 +1490,4 @@ fn insert_canonical_object(
             "one object ID must name exactly one byte string"
         );
     }
-}
-
-fn changed_paths(before: &Tree, after: &Tree) -> BTreeSet<String> {
-    before
-        .keys()
-        .chain(after.keys())
-        .filter(|path| before.get(*path) != after.get(*path))
-        .cloned()
-        .collect()
 }

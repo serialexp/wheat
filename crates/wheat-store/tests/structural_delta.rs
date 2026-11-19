@@ -193,25 +193,20 @@ async fn history_with([a, b, d, c]: [ChangeId; 4]) -> History {
     );
 
     let conflict_revision = repository.current_revision(conflicted_view, c).unwrap();
-    let conflicted = repository
-        .conflicted_application(conflicted_view, conflict_revision)
-        .unwrap()
-        .clone();
-    let mut resolved_tree = conflicted.result.materialized_tree().clone();
-    resolved_tree.insert(
-        "a".into(),
-        FileValue {
-            content: ContentId::of(b"resolved"),
-            kind: FileKind::Regular,
-        },
-    );
     let resolution = repository
         .resolve_conflict(
             base,
             conflicted_view,
             ConflictResolution {
                 conflict_revision,
-                resolved_tree,
+                resolved: [(
+                    "a".into(),
+                    Some(FileValue {
+                        content: ContentId::of(b"resolved"),
+                        kind: FileKind::Regular,
+                    }),
+                )]
+                .into(),
             },
             ApplicationContext::new(&content),
         )

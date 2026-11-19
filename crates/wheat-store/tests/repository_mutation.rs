@@ -278,8 +278,6 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
         content: ContentId::of(b"resolved"),
         kind: FileKind::Regular,
     };
-    let mut resolved_tree = conflicted.result.materialized_tree().clone();
-    resolved_tree.insert("a".into(), resolved_value);
     let clean_application = reference.current_application(effective, a).unwrap().id;
     let stale = mutator
         .resolve_conflict(
@@ -369,7 +367,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             effective,
             ConflictResolution {
                 conflict_revision,
-                resolved_tree,
+                resolved: [("a".into(), Some(resolved_value))].into(),
             },
             ApplicationContext::new(&content),
         )
@@ -608,19 +606,13 @@ async fn resolve_conflict_like_the_reference(
         content: ContentId::of(bytes),
         kind,
     });
-    let mut resolved_tree = application.result.materialized_tree().clone();
-    if let Some(value) = value {
-        resolved_tree.insert("file".into(), value);
-    } else {
-        resolved_tree.remove("file");
-    }
     let expected = reference
         .resolve_conflict(
             base,
             effective,
             ConflictResolution {
                 conflict_revision,
-                resolved_tree,
+                resolved: [("file".into(), value)].into(),
             },
             ApplicationContext::new(&content),
         )
@@ -655,6 +647,188 @@ async fn resolve_conflict_like_the_reference(
             .id,
         expected_state
     );
+}
+
+/// `edits` and `more` as one revision.
+fn together(mut edits: RevisionEdits, more: RevisionEdits) -> RevisionEdits {
+    edits.edits.extend(more.edits);
+    edits.transition.added.extend(more.transition.added);
+    edits.transition.removed.extend(more.transition.removed);
+    edits
+}
+
+#[tokio::test]
+async fn a_resolution_must_name_every_conflicted_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    for bytes in [b"base".as_slice(), b"authored", b"upstream", b"resolved"] {
+        content.put(bytes).unwrap();
+    }
+
+    // `parent` creates x and y, `child` rewrites both, then `parent` is revised under it.
+    let mut reference = Repository::new(Tree::new());
+    let base = reference.base_view().id;
+    let parent = ChangeId::new();
+    let parent_edits = together(exact("x", None, b"base"), exact("y", None, b"base"));
+    let old_edits = parent_edits.edits.keys().copied().collect::<Vec<_>>();
+    let parent_outcome = reference
+        .create_change_with_id(
+            base,
+            base,
+            parent,
+            [],
+            parent_edits,
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let child = ChangeId::new();
+    let child_outcome = reference
+        .create_change_with_id(
+            base,
+            parent_outcome.resulting_view,
+            child,
+            [parent],
+            together(
+                exact("x", Some(b"base"), b"authored"),
+                exact("y", Some(b"base"), b"authored"),
+            ),
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let head = RepositoryPublisher::new(&objects, &content, &heads)
+        .initialize(&reference)
+        .await
+        .unwrap();
+    let mut upstream = together(exact("x", None, b"upstream"), exact("y", None, b"upstream"));
+    upstream.transition.removed.extend(old_edits);
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+    let (prepared, revised) = mutator
+        .revise(
+            head,
+            base,
+            child_outcome.resulting_view,
+            parent,
+            parent_outcome.revision_id,
+            RevisionMetadata::default(),
+            upstream.clone(),
+        )
+        .await
+        .unwrap();
+    reference
+        .revise_change(
+            base,
+            child_outcome.resulting_view,
+            parent,
+            parent_outcome.revision_id,
+            upstream,
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let head = mutator.publish(prepared).await.unwrap();
+    let mut effective = revised.resulting_view;
+    let revision = reference.current_revision(effective, child).unwrap();
+    let conflicted = reference
+        .conflicted_application(effective, revision)
+        .unwrap()
+        .clone();
+    let ApplicationResult::Conflicted { conflict, .. } = &conflicted.result else {
+        unreachable!()
+    };
+    let edits = reference.revision(revision).unwrap().edits().clone();
+    let paths = conflict
+        .edits
+        .keys()
+        .map(|id| edits[id].path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(paths, BTreeSet::from(["x", "y"]));
+    let application = conflicted.id;
+
+    let resolved = FileValue {
+        content: ContentId::of(b"resolved"),
+        kind: FileKind::Regular,
+    };
+    // Leaving y out would replace its failed edit with nothing: refused, naming y.
+    let only_x = [("x".to_string(), Some(resolved))]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        reference
+            .resolve_conflict(
+                base,
+                effective,
+                ConflictResolution {
+                    conflict_revision: revision,
+                    resolved: only_x.clone(),
+                },
+                ApplicationContext::new(&content),
+            )
+            .unwrap_err(),
+        RepositoryError::UnresolvedConflictPaths(vec!["y".into()])
+    );
+    let refused = mutator
+        .resolve_conflict(
+            head,
+            base,
+            effective,
+            PersistedConflictResolution {
+                conflict_revision: revision,
+                application,
+                resolved: only_x,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            &refused,
+            RepositoryMutationError::Model(RepositoryError::UnresolvedConflictPaths(paths))
+                if paths == &["y"]
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(heads.read().unwrap(), head);
+
+    let both = [("x".to_string(), Some(resolved)), ("y".to_string(), None)]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let expected = reference
+        .resolve_conflict(
+            base,
+            effective,
+            ConflictResolution {
+                conflict_revision: revision,
+                resolved: both.clone(),
+            },
+            ApplicationContext::new(&content),
+        )
+        .unwrap();
+    let (prepared, actual) = mutator
+        .resolve_conflict(
+            head,
+            base,
+            effective,
+            PersistedConflictResolution {
+                conflict_revision: revision,
+                application,
+                resolved: both,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(prepared.state(), reference.canonical_closure().state.id);
+    let head = mutator.publish(prepared).await.unwrap();
+    effective = actual.resulting_view;
+    let reader = RepositoryReader::new(&objects, &content);
+    let state = reader.envelope(head.envelope).await.unwrap().state;
+    reader.validate_complete(state).await.unwrap();
+    let tree = &reference.view(effective).unwrap().tree;
+    assert_eq!(tree.get("x"), Some(&resolved));
+    assert_eq!(tree.get("y"), None);
+    assert_eq!(reference.conflicts(effective).unwrap().count(), 0);
 }
 
 async fn reader_state(

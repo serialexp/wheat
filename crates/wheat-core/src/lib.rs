@@ -74,7 +74,7 @@ pub use model::{
 pub use persisted::{RepositoryStateRecord, ViewRecord};
 pub use repository::{
     ChangeProposal, Repository, RepositoryError, RepositoryParts, RevisionOutcome, RevisionRequest,
-    RevisionsOutcome, TargetPolicyResult,
+    RevisionsOutcome, TargetPolicyResult, check_resolved_paths,
 };
 pub use root_builders::{build_repository_state_record, build_view_record};
 pub use segment_records::{
