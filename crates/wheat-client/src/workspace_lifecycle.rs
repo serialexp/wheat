@@ -46,13 +46,15 @@ pub enum StoreLocation<'a> {
 }
 
 /// The place picked for a new workspace's new store. Dropped before [`Self::keep`], it
-/// undoes what [`Self::place`] made, so a failed `init` or `clone` can be run again:
-/// an in-workspace store goes with the `.wheat` directory made for it. A store
-/// elsewhere is left where it is.
+/// undoes what [`Self::place`] and [`Self::create`] made, so a failed `init` or `clone`
+/// leaves no store behind and can be run again: the store directory it created goes,
+/// and an in-workspace store's `.wheat` directory with it.
 pub struct NewStore {
     root: PathBuf,
     /// The `.wheat` directory made to hold an in-workspace store.
     made_control: Option<PathBuf>,
+    /// Whether [`Self::create`] made `root`, so everything in it is this store's.
+    made_root: bool,
 }
 
 impl NewStore {
@@ -64,10 +66,12 @@ impl NewStore {
             StoreLocation::Explicit(store) => Self {
                 root: store.to_path_buf(),
                 made_control: None,
+                made_root: false,
             },
             StoreLocation::Home => Self {
                 root: crate::discovery::allocate_store_root()?,
                 made_control: None,
+                made_root: false,
             },
             StoreLocation::InWorkspace => {
                 initialize_workspace_directory(workspace_root)?;
@@ -78,6 +82,7 @@ impl NewStore {
                 Self {
                     root: control.join(WORKSPACE_STORE_DIR),
                     made_control: Some(control),
+                    made_root: false,
                 }
             }
         })
@@ -87,15 +92,39 @@ impl NewStore {
         &self.root
     }
 
+    /// Creates the store's empty directory, refusing one that already exists, which
+    /// then belongs to this store until [`Self::keep`].
+    pub fn create(&mut self) -> Result<()> {
+        match fs::create_dir(&self.root) {
+            Ok(()) => {
+                self.made_root = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(CliFailure::invalid(format!(
+                    "Wheat store destination already exists: {}",
+                    self.root.display()
+                )))
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("create Wheat store {}", self.root.display()))
+            }
+        }
+    }
+
     /// The workspace was made: keep the store.
     pub fn keep(mut self) -> PathBuf {
         self.made_control = None;
+        self.made_root = false;
         std::mem::take(&mut self.root)
     }
 }
 
 impl Drop for NewStore {
     fn drop(&mut self) {
+        if self.made_root {
+            let _ = fs::remove_dir_all(&self.root);
+        }
         if let Some(control) = self.made_control.take() {
             let _ = fs::remove_dir_all(control);
         }
@@ -106,7 +135,8 @@ impl Drop for NewStore {
 /// `workspace_root`, which must not be a workspace yet.
 pub fn init(workspace_root: &Path, location: StoreLocation<'_>) -> Result<Initialized> {
     ensure_fresh_workspace(workspace_root)?;
-    let store = NewStore::place(workspace_root, location)?;
+    let mut store = NewStore::place(workspace_root, location)?;
+    store.create()?;
     let initialized = init_at(workspace_root, store.root())?;
     store.keep();
     Ok(initialized)
@@ -396,4 +426,46 @@ pub fn initialize_workspace_directory(root: &Path) -> Result<()> {
         std::fs::create_dir_all(root)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_store_dropped_before_keep_removes_what_it_created() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        let mut store = NewStore::place(temporary.path(), StoreLocation::Explicit(&root)).unwrap();
+        store.create().unwrap();
+        fs::write(root.join("repository.head"), b"half a clone").unwrap();
+        drop(store);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_new_store_never_removes_a_directory_it_did_not_create() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("someone-elses"), b"keep").unwrap();
+        let mut store = NewStore::place(temporary.path(), StoreLocation::Explicit(&root)).unwrap();
+        let refused = store.create().unwrap_err();
+        assert!(
+            refused.to_string().contains("already exists"),
+            "{refused:#}"
+        );
+        drop(store);
+        assert_eq!(fs::read(root.join("someone-elses")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_kept_new_store_stays() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("store");
+        let mut store = NewStore::place(temporary.path(), StoreLocation::Explicit(&root)).unwrap();
+        store.create().unwrap();
+        assert_eq!(store.keep(), root);
+        assert!(root.is_dir());
+    }
 }

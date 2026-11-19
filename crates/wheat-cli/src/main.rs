@@ -3079,15 +3079,11 @@ fn native_clone(
 
     // Ask the helper before creating anything, so a failure leaves no store.
     let token = credential::token_for(&UserConfig::from_environment()?, None, &parsed)?;
-    let new_store = workspace_lifecycle::NewStore::place(&workspace_root, location)?;
+    // Removed again unless the clone gets as far as `keep`, so a clone that fails to
+    // connect, authenticate, fetch, validate or set up the workspace leaves no store.
+    let mut new_store = workspace_lifecycle::NewStore::place(&workspace_root, location)?;
+    new_store.create()?;
     let store_root = new_store.root().to_path_buf();
-    if store_root.exists() {
-        return Err(CliFailure::invalid(format!(
-            "Wheat store destination already exists: {}",
-            store_root.display()
-        )));
-    }
-    std::fs::create_dir(&store_root)?;
 
     let objects = wheat_store::PackedObjectStore::open(store_root.join("storage"))?;
     let heads = wheat_store::LocalPublicationStore::new(store_root.join("repository.head"));

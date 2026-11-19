@@ -549,6 +549,7 @@ mod tests {
     ) {
         let temporary = tempfile::tempdir().unwrap();
         let store_root = temporary.path().join("store");
+        fs::create_dir(&store_root).unwrap();
         crate::local::initialize(&store_root).unwrap();
         let store = crate::workspace_metadata::StoreMetadata::create(&store_root).unwrap();
         let store_root = store_root.canonicalize().unwrap();

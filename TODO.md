@@ -308,12 +308,6 @@ budget passes, but by only about 0.7 s.
   platform code. `discovery.rs` (the device that stops discovery at a mount) and
   `store_analyze.rs` (allocated bytes) also keep small `cfg(unix)` branches, whose
   non-Unix halves guess instead of failing.
-- `[ ]` **A clone that fails to connect leaves an empty store behind (2026-10-29).**
-  `clone` in `crates/wheat-cli/src/main.rs` creates the store directory (and opens
-  its packed storage) before `remote::open`, and nothing removes it when the
-  connection, the token, the certificate or the fetch fails, so every failed clone
-  leaves a store in the store home. Only a failing `credential.helper` is checked
-  first.
 - `[ ]` **Capturing `.git` paths is not gated (2026-09-26).** Writing paths inside
   `.git` now asks or needs `--allow-dot-git`, but `wheat add .git/config` captures
   one without a word. In a workspace that is also a git checkout that could put

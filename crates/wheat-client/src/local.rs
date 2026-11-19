@@ -76,11 +76,11 @@ pub fn open(root: &Path) -> Result<LocalRepository> {
     })
 }
 
+/// Initializes a new store in `root`, an empty directory its creator made for it.
 pub fn initialize(root: &Path) -> Result<()> {
-    if root.exists() {
-        bail!("Wheat store destination already exists: {}", root.display());
+    if std::fs::read_dir(root)?.next().is_some() {
+        bail!("Wheat store destination is not empty: {}", root.display());
     }
-    std::fs::create_dir(root)?;
     let heads = LocalPublicationStore::new(root.join("repository.head"));
     let objects = PackedObjectStore::open(root.join("storage"))?;
     let content = objects.content_store();

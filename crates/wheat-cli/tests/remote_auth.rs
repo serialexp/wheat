@@ -182,6 +182,16 @@ impl Fixture {
     }
 }
 
+/// What a clone named `name` left in its store home, besides its config.
+fn stores_left(fixture: &Fixture, name: &str) -> Vec<std::ffi::OsString> {
+    let stores = fixture.root.path().join(format!("{name}-stores"));
+    fs::read_dir(&stores)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "config")
+        .collect()
+}
+
 #[test]
 fn clone_sends_the_token_from_credential_helper() {
     let fixture = serve_with_token_file();
@@ -212,6 +222,34 @@ fn clone_with_a_wrong_token_names_the_helper() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("refused the token"), "{stderr}");
+    assert_eq!(stores_left(&fixture, "wrong-token"), [] as [&str; 0]);
+}
+
+#[test]
+fn a_clone_that_cannot_connect_leaves_no_store() {
+    let fixture = serve_with_token_file();
+    // A port nothing listens on any more.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let helper = format!("printf 'token={TOKEN}\\n' #");
+    let output = fixture.clone_from(
+        &format!("wheat://{closed}/team/repo"),
+        "unreachable",
+        Some(&helper),
+        None,
+    );
+    assert!(!output.status.success());
+    assert_eq!(stores_left(&fixture, "unreachable"), [] as [&str; 0]);
+
+    // Nothing is in the way of trying again once the server answers.
+    let output = fixture.clone_from(&fixture.url(), "unreachable-retry", Some(&helper), None);
+    assert!(
+        output.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -221,13 +259,7 @@ fn a_failing_helper_creates_no_store() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("credential.helper failed"), "{stderr}");
-    let stores = fixture.root.path().join("broken-helper-stores");
-    let leftovers: Vec<_> = fs::read_dir(&stores)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name != "config")
-        .collect();
-    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    assert_eq!(stores_left(&fixture, "broken-helper"), [] as [&str; 0]);
 }
 #[test]
 fn clone_over_tls_checks_the_server_against_the_trusted_roots() {
@@ -252,6 +284,7 @@ fn clone_over_tls_refuses_a_server_it_does_not_trust() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("certificate"), "{stderr}");
     assert!(!fixture.root.path().join("untrusted/.wheat").exists());
+    assert_eq!(stores_left(&fixture, "untrusted"), [] as [&str; 0]);
 }
 
 #[test]

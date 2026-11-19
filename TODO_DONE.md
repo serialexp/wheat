@@ -659,6 +659,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   `crates/wheat-cli/tests/remote_fetch.rs`.
 
 ## Loose ends found in the design-doc audit (2026-09-25)
+- `[x]` **A clone that fails to connect leaves an empty store behind (2026-10-29).**
+  Fixed 2026-11-19: `NewStore::create` makes the store's directory, refusing one that
+  exists, and a `NewStore` dropped before `keep` removes the directory it made, for
+  every location (it used to undo only an in-workspace store). So a `clone` that fails
+  to connect, authenticate, fetch, validate or set up the workspace, and an `init`
+  that fails, leave no store; `local::initialize` now fills an empty directory its
+  creator made. Tests: `remote_auth.rs` `a_clone_that_cannot_connect_leaves_no_store`
+  (and the wrong-token and untrusted-certificate clones check the store home too),
+  and `workspace_lifecycle` unit tests that a `NewStore` never removes a directory it
+  did not create.
 - `[x]` **The fetch walk has no cap on repeated radix subtrees (2026-09-26).** A
   radix node's ID does not include its key path, so a crafted map can repeat a few
   nodes under every edge, and `StructuralDelta` walked a node once per (node, role,
