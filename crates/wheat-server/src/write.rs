@@ -257,6 +257,14 @@ impl StageBuilder {
         RepositoryReader::new(self.inner.stage.as_ref(), self.inner.stage.content())
     }
 
+    /// The stage's objects, the durable store with what was built into it: what the
+    /// collection stores (`ApplicationMapStore`, `ConflictSetStore` and the like) read
+    /// a built view's maps and sets through, which [`Self::reader`]'s records name.
+    #[must_use]
+    pub fn objects(&self) -> &RepositoryStage<Network> {
+        self.inner.stage.as_ref()
+    }
+
     /// The network's content, where a build puts what its edits write. A put is
     /// stored at once, not staged.
     #[must_use]

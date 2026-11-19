@@ -28,8 +28,9 @@ use wheat_server::write::{
     LabelChange, ServerStage, ServerWrite, Submission, WriteFailure, open_stage, published, write,
 };
 use wheat_store::{
-    LabelMove, LocalPublicationStore, MerkleTreeStore, PackedObjectStore, PublicationError,
-    PublicationStore, RepositoryHead, RepositoryPublisher, RepositoryReader,
+    ApplicationMapStore, ConflictSetStore, LabelMove, LocalPublicationStore, MerkleTreeStore,
+    PackedObjectStore, PublicationError, PublicationStore, RepositoryHead, RepositoryPublisher,
+    RepositoryReader,
 };
 
 use support::edit;
@@ -434,6 +435,52 @@ async fn a_submit_whose_receipt_a_capped_store_dropped_is_unknown() {
             "{key:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_build_reads_the_maps_of_what_it_built_through_the_stage_objects() {
+    let server = server(None).await;
+    let stage = open_stage(&server.entry).await.unwrap();
+    let (first, base) = (server.first, server.base);
+    // A change beside `first` writing its file otherwise: joined, one conflicts.
+    let rival = edit_in(&stage, base, "one.txt", b"uno").await;
+    let (application, joined) = stage
+        .build(move |builder| async move {
+            let mutator = builder.mutator();
+            let (prepared, outcome) = mutator
+                .integrate(builder.head(), base, &[first, rival])
+                .await
+                .unwrap();
+            mutator.publish(prepared).await.unwrap();
+            let [change] = outcome.conflicted[..] else {
+                panic!("one change conflicts: {outcome:?}");
+            };
+            let joined = builder.reader().view(outcome.resulting_view).await.unwrap();
+            let application = ApplicationMapStore::new(builder.objects())
+                .get(joined.applications, change)
+                .await
+                .unwrap()
+                .expect("the joined view applies the change");
+            let record = builder.reader().application(application).await.unwrap();
+            let wheat_core::ApplicationResultRecord::Conflicted { conflict, .. } = record.result
+            else {
+                panic!("the change's application conflicted");
+            };
+            assert!(
+                ConflictSetStore::new(builder.objects())
+                    .contains(joined.unresolved_conflicts, conflict)
+                    .await
+                    .unwrap()
+            );
+            (application, outcome.resulting_view)
+        })
+        .await
+        .unwrap();
+    // What the build made stays in the stage until it is submitted.
+    let content = server.objects.content_store();
+    let durable = RepositoryReader::new(&server.objects, &content);
+    assert!(durable.application(application).await.is_err());
+    assert!(durable.view(joined).await.is_err());
 }
 
 #[tokio::test]
