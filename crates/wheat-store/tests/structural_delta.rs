@@ -198,6 +198,7 @@ async fn history_with([a, b, d, c]: [ChangeId; 4]) -> History {
             base,
             conflicted_view,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 resolved: [(
                     "a".into(),

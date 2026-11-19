@@ -496,6 +496,7 @@ impl Resolved {
                 history.base,
                 conflicted,
                 PersistedConflictResolution {
+                    metadata: RevisionMetadata::default(),
                     conflict_revision: first_conflict.revision_id,
                     application: first_conflict.id(),
                     resolved: [

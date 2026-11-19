@@ -217,6 +217,7 @@ where
                 base,
                 effective,
                 PersistedConflictResolution {
+                    metadata: RevisionMetadata::default(),
                     conflict_revision,
                     application,
                     resolved: [(

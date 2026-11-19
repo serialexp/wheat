@@ -139,6 +139,8 @@ pub struct PersistedConflictResolution {
     pub conflict_revision: RevisionId,
     pub application: ApplicationId,
     pub resolved: BTreeMap<String, Option<FileValue>>,
+    /// The resolving revision's author, committer, times and note.
+    pub metadata: RevisionMetadata,
 }
 
 /// A repository opened once by [`PersistedRepositoryMutator::open_authoring`]. It is read with
@@ -564,7 +566,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             effective_view,
             change,
             resolution.conflict_revision,
-            RevisionMetadata::default(),
+            resolution.metadata,
             revision_edits,
         )
         .await

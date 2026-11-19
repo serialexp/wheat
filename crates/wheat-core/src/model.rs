@@ -882,4 +882,6 @@ pub struct ConflictResolution {
     /// must name every such path and no other: the failed edits are all replaced, and a
     /// revision's own edits must apply, so none can be kept for later.
     pub resolved: BTreeMap<String, Option<FileValue>>,
+    /// The resolving revision's author, committer, times and note.
+    pub metadata: RevisionMetadata,
 }

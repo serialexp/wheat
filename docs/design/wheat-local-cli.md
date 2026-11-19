@@ -31,6 +31,8 @@ both lists.
   named, and settles the resolved paths into the materialized pin as `add` does; a
   resolution must cover every path the conflict's failed edits wrote, since all of
   them are replaced. `--value`/`--kind`/`--delete` resolve one named path instead.
+  The resolution revision is authored like any other: by the configured actor, with
+  `-m`, `--authored-at` and `--committed-at` as `add` takes them.
 - [x] **Git bootstrap and publication compatibility.** `wheat import` accepts a
   local Git repository or temporary-mirrors a Git URL into a fresh packed Wheat
   repository; `wheat push` projects a selected clean native view and publishes

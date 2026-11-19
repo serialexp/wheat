@@ -148,9 +148,6 @@ for `wheat labels` here; gone since incremental-validation step 9, 2026-10-22):
   resolution from the workspace file and settles the pin as `add` does (so `status`
   shows it unchanged); what is left is writing both sides, with
   markers, into the workspace for the author to edit.
-- `[ ]` **Resolution revisions have no author or date (2026-10-21).** They use
-  `RevisionMetadata::default()` (`repository_mutation.rs:445`), so `wheat log` shows
-  `author  <> 1970-01-01T00:00:00Z`; integrate's combine-by-date order may see it too.
 - `[ ]` **`wheat add <directory>` adds nothing (2026-10-20).** With `many/00/1.txt`
   and `many/00/2.txt` untracked, `wheat add many` reports "added 1 path(s)" and makes
   a revision, but `status` still lists every file under `many/` as untracked. Either

@@ -1070,6 +1070,7 @@ async fn resolve_child(
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 application,
                 resolved: [("file".into(), Some(resolved))].into(),

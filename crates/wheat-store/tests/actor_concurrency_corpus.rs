@@ -234,6 +234,7 @@ async fn competing_human_and_agent_resolutions_refuse_the_stale_loser() {
         .unwrap()
         .id;
     let resolution = |bytes: &[u8]| PersistedConflictResolution {
+        metadata: RevisionMetadata::default(),
         conflict_revision,
         application,
         resolved: [(

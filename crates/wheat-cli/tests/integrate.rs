@@ -486,10 +486,48 @@ fn a_conflict_on_two_paths_resolves_from_the_workspace() {
 
     fs::write(reader.join("x"), "settled").unwrap();
     fs::remove_file(reader.join("y")).unwrap();
-    ok(reader, stores, config, &["resolve"]);
+    ok(
+        reader,
+        stores,
+        config,
+        &[
+            "resolve",
+            "-m",
+            "settle x, drop y",
+            "--authored-at",
+            "2026-11-19T10:00:00+01:00",
+        ],
+    );
 
     let conflicts = ok_json(reader, stores, config, &["conflicts"]);
     assert_eq!(conflicts["conflicts"], serde_json::json!([]), "{conflicts}");
+    // The resolution revision is authored like any other: by the actor, at the given
+    // time, with its message, and committed now.
+    let log = ok_json(reader, stores, config, &["log"]);
+    let resolution = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| !entry["predecessor"].is_null())
+        .unwrap_or_else(|| panic!("no resolution revision: {log}"));
+    let revision = &resolution["revision"];
+    assert_eq!(revision["message"], "settle x, drop y", "{log}");
+    for actor in ["author", "committer"] {
+        assert_eq!(
+            revision[actor],
+            serde_json::json!({ "name": "Test", "email": "test@example.com" }),
+            "{log}"
+        );
+    }
+    assert_eq!(
+        revision["authored_at"],
+        serde_json::json!({ "seconds": 1_795_078_800, "offset_minutes": 60 }),
+        "{log}"
+    );
+    assert!(
+        revision["committed_at"]["seconds"].as_i64().unwrap() > 1_795_078_800,
+        "{log}"
+    );
     // The working view holds x as written and no y, as the workspace does.
     let status = ok_json(reader, stores, config, &["status"]);
     assert_eq!(status["changes"], serde_json::json!([]), "{status}");

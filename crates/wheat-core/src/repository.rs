@@ -1028,7 +1028,7 @@ impl Repository {
             PendingRevision {
                 predecessor: Some(resolution.conflict_revision),
                 dependencies,
-                metadata: RevisionMetadata::default(),
+                metadata: resolution.metadata,
                 edits: revision_edits,
             },
         )]);

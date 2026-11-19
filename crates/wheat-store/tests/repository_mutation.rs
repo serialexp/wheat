@@ -285,6 +285,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: a1.revision_id,
                 application: conflicted.id,
                 resolved: BTreeMap::new(),
@@ -303,6 +304,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: expected_revise.revision_id,
                 application: clean_application,
                 resolved: BTreeMap::new(),
@@ -322,6 +324,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 application: conflicted.id,
                 resolved: [("b".into(), Some(resolved_value))].into(),
@@ -340,6 +343,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 application: conflicted.id,
                 resolved: [(
@@ -366,6 +370,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 resolved: [("a".into(), Some(resolved_value))].into(),
             },
@@ -380,6 +385,7 @@ async fn root_backed_create_and_revise_match_reference_and_preserve_roots_and_la
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 application: conflicted.id,
                 resolved: [("a".into(), Some(resolved_value))].into(),
@@ -611,6 +617,7 @@ async fn resolve_conflict_like_the_reference(
             base,
             effective,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 resolved: [("file".into(), value)].into(),
             },
@@ -624,6 +631,7 @@ async fn resolve_conflict_like_the_reference(
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision,
                 application: application.id,
                 resolved: [("file".into(), value)].into(),
@@ -759,6 +767,7 @@ async fn a_resolution_must_name_every_conflicted_path() {
                 base,
                 effective,
                 ConflictResolution {
+                    metadata: RevisionMetadata::default(),
                     conflict_revision: revision,
                     resolved: only_x.clone(),
                 },
@@ -773,6 +782,7 @@ async fn a_resolution_must_name_every_conflicted_path() {
             base,
             effective,
             PersistedConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: revision,
                 application,
                 resolved: only_x,
@@ -794,11 +804,21 @@ async fn a_resolution_must_name_every_conflicted_path() {
     let both = [("x".to_string(), Some(resolved)), ("y".to_string(), None)]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    // The resolution revision carries the metadata it is given.
+    let metadata = RevisionMetadata {
+        message: "settle x, drop y".into(),
+        authored_at: Timestamp {
+            seconds: 1_795_078_800,
+            offset_minutes: 60,
+        },
+        ..RevisionMetadata::default()
+    };
     let expected = reference
         .resolve_conflict(
             base,
             effective,
             ConflictResolution {
+                metadata: metadata.clone(),
                 conflict_revision: revision,
                 resolved: both.clone(),
             },
@@ -811,6 +831,7 @@ async fn a_resolution_must_name_every_conflicted_path() {
             base,
             effective,
             PersistedConflictResolution {
+                metadata: metadata.clone(),
                 conflict_revision: revision,
                 application,
                 resolved: both,
@@ -829,6 +850,11 @@ async fn a_resolution_must_name_every_conflicted_path() {
     assert_eq!(tree.get("x"), Some(&resolved));
     assert_eq!(tree.get("y"), None);
     assert_eq!(reference.conflicts(effective).unwrap().count(), 0);
+    let resolution = reference.current_revision(effective, child).unwrap();
+    assert_eq!(
+        reference.revision(resolution).unwrap().metadata(),
+        &metadata
+    );
 }
 
 async fn reader_state(

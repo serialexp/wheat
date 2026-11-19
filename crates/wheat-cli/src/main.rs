@@ -893,6 +893,8 @@ struct ResolveArgs {
     /// Resolve the one named path by deleting it.
     #[arg(long)]
     delete: bool,
+    #[command(flatten)]
+    metadata: RevisionMetadataArgs,
 }
 
 fn main() -> ExitCode {
@@ -2665,6 +2667,18 @@ fn resolve(
             "--value, --kind and --delete resolve exactly one named path",
         ));
     }
+    let (_, revision_metadata) = authoring_metadata::metadata(
+        &UserConfig::from_environment()?,
+        store_root,
+        authoring_metadata::MetadataArgs {
+            message: arguments.metadata.message.unwrap_or_default(),
+            description: None,
+            created_at: None,
+            authored_at: arguments.metadata.authored_at,
+            committed_at: arguments.metadata.committed_at,
+        },
+        false,
+    )?;
     let local = open(store_root)?;
     let _operation = rewrite_transaction::StoreOperationGuard::acquire(store_root, &local)?;
     let _workspace_lock = materialization::WorkspaceLock::acquire(workspace_root)?;
@@ -2728,6 +2742,7 @@ fn resolve(
     }
     let resolved_paths = resolved.keys().cloned().collect::<Vec<_>>();
     let resolution = PersistedConflictResolution {
+        metadata: revision_metadata,
         conflict_revision: conflict.revision_id,
         application: conflict.application_id,
         resolved,

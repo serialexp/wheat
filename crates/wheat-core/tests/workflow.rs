@@ -391,6 +391,7 @@ fn conflict_is_durable_and_resolution_continues_descendant_application() {
             repository.base_view().id,
             effective,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: b1.revision_id,
                 resolved: [("shared".into(), Some(value(&io, "resolved")))].into(),
             },
@@ -877,6 +878,7 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
             repository.base_view().id,
             effective,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: b1.revision_id,
                 resolved: resolved.clone(),
             },
@@ -889,6 +891,7 @@ fn resolving_a_stale_conflicted_revision_is_rejected() {
             repository.base_view().id,
             effective,
             ConflictResolution {
+                metadata: RevisionMetadata::default(),
                 conflict_revision: b1.revision_id,
                 resolved
             },

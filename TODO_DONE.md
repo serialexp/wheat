@@ -233,6 +233,16 @@ Finished items, moved here from `TODO.md` under the same headings.
   normalizes only when all three are guarded text (`edit_capture::is_guarded_text`),
   and otherwise captures a whole-file transition. Test: `local_workflow.rs`
   `a_binary_file_from_an_earlier_change_adds_to_a_later_one`.
+- `[x]` **Resolution revisions have no author or date (2026-10-21).** They used
+  `RevisionMetadata::default()`, so `wheat log` showed `author  <> 1970-01-01T00:00:00Z`
+  and integrate's combine-by-date order could see it too. Fixed 2026-11-19:
+  `ConflictResolution` and `PersistedConflictResolution` carry a `metadata`, and `wheat
+  resolve` builds it like `add` does (the configured actor, `-m`, `--authored-at`,
+  `--committed-at`). Tests: store `repository_mutation.rs`
+  `a_resolution_must_name_every_conflicted_path` (the reference and the store keep the
+  given metadata), CLI `integrate.rs`
+  `a_conflict_on_two_paths_resolves_from_the_workspace` (`wheat log` shows the actor,
+  message and dates).
 
 - `[x]` **A native pull or fetch without `remote.meta` is an internal error
   (2026-10-21).** Fixed 2026-10-29: `resolve_remote` refuses with `invalid_input` and
