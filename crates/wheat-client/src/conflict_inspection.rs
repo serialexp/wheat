@@ -342,7 +342,7 @@ pub fn human(document: &ConflictDocument, destination: &mut impl Write) -> Resul
                     "  {:?}: {}; {}",
                     edit.path,
                     edit.reason,
-                    Wants(edit.target)
+                    Found(edit.target)
                 )?;
             }
         }
@@ -350,20 +350,21 @@ pub fn human(document: &ConflictDocument, destination: &mut impl Write) -> Resul
     })
 }
 
-/// What an edit would have made of its path.
-struct Wants(Option<FileValue>);
+/// What the edit found at its path where it was applied: the evidence's
+/// `target`, which is the view's value, not what the edit would write.
+struct Found(Option<FileValue>);
 
-impl std::fmt::Display for Wants {
+impl std::fmt::Display for Found {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            None => formatter.write_str("it deletes the path"),
+            None => formatter.write_str("the path does not exist there"),
             Some(FileValue { content, kind }) => {
                 let kind = match kind {
                     FileKind::Regular => "a file",
                     FileKind::Executable => "an executable file",
                     FileKind::Symlink => "a symlink",
                 };
-                write!(formatter, "it writes {kind} with content {content}")
+                write!(formatter, "it found {kind} with content {content}")
             }
         }
     }
@@ -608,7 +609,7 @@ mod tests {
         assert_eq!(
             rendered,
             format!(
-                "conflict in change {} \"Make it executable\" (revision {})\n  \"bin/run\": the file kind differs from the edit's; it writes an executable file with content {content}\n",
+                "conflict in change {} \"Make it executable\" (revision {})\n  \"bin/run\": the file kind differs from the edit's; it found an executable file with content {content}\n",
                 ChangeId::from_bytes([5; 16]),
                 RevisionId::from_digest([6; 32]),
             )
