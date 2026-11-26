@@ -891,11 +891,7 @@ impl Repository {
         let application = self
             .conflicted_application(effective, resolution.conflict_revision)
             .ok_or(RepositoryError::NotConflicted(resolution.conflict_revision))?;
-        let ApplicationResult::Conflicted {
-            partial_tree,
-            conflict,
-        } = &application.result
-        else {
+        let ApplicationResult::Conflicted { conflict, .. } = &application.result else {
             unreachable!()
         };
         let conflict_paths = conflict
@@ -905,15 +901,16 @@ impl Repository {
             .map(|edit| edit.path.as_str())
             .collect::<BTreeSet<_>>();
         check_resolved_paths(&conflict_paths, &resolution.resolved)?;
-        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
+        let conflicted = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
+
+        // Each resolved path is captured from the target's file: see [`resolution_edits`].
+        let target = self.views[&application.target_view].clone();
         let changed_paths = resolution
             .resolved
             .iter()
-            .filter(|(path, value)| partial_tree.get(*path) != value.as_ref())
+            .filter(|(path, value)| target.tree.get(path.as_str()) != value.as_ref())
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-
-        let target = self.views[&application.target_view].clone();
         let mut edits = BTreeMap::new();
         let mut generated = BTreeMap::new();
         let content_error = |error: C::Error| RepositoryError::ContentIo(error.to_string());
@@ -994,30 +991,13 @@ impl Repository {
                 .store_generated(content.borrowed())
                 .map_err(|error| RepositoryError::ContentIo(error.to_string()))?;
         }
-        let replacement_edits = edits.keys().copied().collect::<BTreeSet<_>>();
-        let preserved = revision
-            .edits()
-            .keys()
-            .filter(|id| !removed.contains(id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut revision_edit_records = revision.edits().clone();
-        revision_edit_records.retain(|id, _| preserved.contains(id));
-        revision_edit_records.extend(edits);
-        let revision_edits = RevisionEdits {
-            edits: revision_edit_records,
-            transition: crate::EditTransition {
-                preserved,
-                removed: removed.clone(),
-                added: replacement_edits.clone(),
-                resolutions: vec![crate::ConflictResolutionEvidence {
-                    application: application.id,
-                    conflicted_edits: removed,
-                    replacement_edits,
-                }],
-                ..crate::EditTransition::default()
-            },
-        };
+        let revision_edits = resolution_edits(
+            revision.edits(),
+            conflicted,
+            application.id,
+            |path| resolution.resolved.contains_key(path),
+            edits,
+        );
         let dependencies = selection
             .dependencies
             .parents(change)
@@ -1471,6 +1451,57 @@ pub fn check_resolved_paths<V>(
         return Err(RepositoryError::UnresolvedConflictPaths(unresolved));
     }
     Ok(())
+}
+
+/// The edits of a revision resolving `application`'s conflict: `replacements`, captured
+/// from the target view's files to the resolved ones, take the place of every edit of
+/// `predecessor` on a path `is_resolved` names, applied or failed (`conflicted`). Keeping
+/// an applied edit on a resolved path beside edits captured from the target would apply
+/// its hunk twice, so only an applied edit the capture reproduces exactly stays. Edits on
+/// other paths stay as they were. A resolution that keeps the target's files leaves the
+/// change with no edits on those paths.
+pub fn resolution_edits(
+    predecessor: &BTreeMap<EditId, EditRecord>,
+    conflicted: BTreeSet<EditId>,
+    application: ApplicationId,
+    is_resolved: impl Fn(&str) -> bool,
+    replacements: BTreeMap<EditId, EditRecord>,
+) -> RevisionEdits {
+    let removed = predecessor
+        .iter()
+        .filter(|(id, edit)| {
+            is_resolved(edit.path.as_str())
+                && (conflicted.contains(id) || !replacements.contains_key(id))
+        })
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let preserved = predecessor
+        .keys()
+        .filter(|id| !removed.contains(id))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let added = replacements
+        .keys()
+        .filter(|id| !preserved.contains(id))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut edits = predecessor.clone();
+    edits.retain(|id, _| preserved.contains(id));
+    edits.extend(replacements);
+    RevisionEdits {
+        edits,
+        transition: crate::EditTransition {
+            preserved,
+            removed,
+            added: added.clone(),
+            resolutions: vec![crate::ConflictResolutionEvidence {
+                application,
+                conflicted_edits: conflicted,
+                replacement_edits: added,
+            }],
+            ..crate::EditTransition::default()
+        },
+    }
 }
 
 fn insert_tree_object(objects: &mut BTreeMap<ObjectId, Vec<u8>>, tree: &Tree) {

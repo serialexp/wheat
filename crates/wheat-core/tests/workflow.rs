@@ -983,3 +983,165 @@ fn rejected_edits_message_names_paths_and_bounds_the_list() {
     assert!(!message.contains("p5: "), "{message}");
     assert!(message.ends_with("; and 3 more"), "{message}");
 }
+
+/// The guarded edits taking `path` from `before` to `after`, as `wheat`
+/// captures a workspace change, with their content stored in `io`.
+fn captured(io: &Memory, path: &str, before: &str, after: &str) -> RevisionEdits {
+    fn snapshot(text: &str) -> edit_capture::FileSnapshot<'_> {
+        edit_capture::FileSnapshot {
+            kind: FileKind::Regular,
+            bytes: text.as_bytes(),
+        }
+    }
+    let captured = edit_capture::capture_edit(
+        path,
+        Some(snapshot(before)),
+        Some(snapshot(after)),
+        None,
+        guarded::Limits::default(),
+    )
+    .unwrap();
+    for content in captured.content.values() {
+        io.store_generated(content.borrowed()).unwrap();
+    }
+    value(io, after);
+    RevisionEdits {
+        transition: EditTransition {
+            added: captured.edits.keys().copied().collect(),
+            ..Default::default()
+        },
+        edits: captured.edits,
+    }
+}
+
+/// Twelve numbered lines, with `first` and `last` in place of the first and
+/// last.
+fn lines(first: &str, last: &str) -> String {
+    let middle = [
+        "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+    ];
+    format!("{first}\n{}\n{last}\n", middle.join("\n"))
+}
+
+/// A change `b` whose two edits of `f` meet an ancestor revised under one
+/// of them: the edit of the first line still applies, the edit of the last
+/// conflicts. Answers the repository, the effective view, `b`'s conflicted
+/// revision and the target view's `f`.
+fn half_applied(io: &Memory) -> (Repository, ViewId, ChangeId, RevisionId) {
+    let ctx = ApplicationContext::new(io);
+    let mut repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let (a, a1) = repository
+        .create_change(
+            base,
+            base,
+            [],
+            exact(io, "f", None, Some(&lines("one", "twelve"))),
+            ctx,
+        )
+        .unwrap();
+    let (b, b1) = repository
+        .create_change(
+            base,
+            a1.resulting_view,
+            [a],
+            captured(io, "f", &lines("one", "twelve"), &lines("ONE", "TWELVE")),
+            ctx,
+        )
+        .unwrap();
+    assert_eq!(current_edits(&repository, b1.resulting_view, b).len(), 2);
+    let old = current_edits(&repository, b1.resulting_view, a);
+    let revised = repository
+        .revise_change(
+            base,
+            b1.resulting_view,
+            a,
+            a1.revision_id,
+            replacement(io, &old, "f", None, Some(&lines("one", "zwölf"))),
+            ctx,
+        )
+        .unwrap();
+    let effective = revised.resulting_view;
+    let application = repository
+        .applications_for_revision(b1.revision_id)
+        .find(|a| matches!(a.result, ApplicationResult::Conflicted { .. }))
+        .expect("b conflicts with the revised a");
+    let ApplicationResult::Conflicted {
+        conflict,
+        partial_tree,
+    } = &application.result
+    else {
+        unreachable!()
+    };
+    assert_eq!(conflict.edits.len(), 1, "only the last line's edit fails");
+    assert_eq!(
+        partial_tree.get("f"),
+        Some(&value(io, &lines("ONE", "zwölf")))
+    );
+    (repository, effective, b, b1.revision_id)
+}
+
+#[test]
+fn a_resolution_of_a_path_the_change_also_applied_an_edit_to_lands_exactly() {
+    let io = Memory::default();
+    let ctx = ApplicationContext::new(&io);
+    let (mut repository, effective, b, conflicted) = half_applied(&io);
+    let resolved = lines("ONE", "TWELVE and zwölf");
+    let outcome = repository
+        .resolve_conflict(
+            repository.base_view().id,
+            effective,
+            ConflictResolution {
+                metadata: RevisionMetadata::default(),
+                conflict_revision: conflicted,
+                resolved: [("f".into(), Some(value(&io, &resolved)))].into(),
+            },
+            ctx,
+        )
+        .unwrap();
+    let view = repository.view(outcome.resulting_view).unwrap();
+    assert_eq!(view.tree.get("f"), Some(&value(&io, &resolved)));
+    assert_eq!(
+        repository
+            .conflicts(outcome.resulting_view)
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(view.unresolved_conflicts.is_empty());
+    assert!(!current_edits(&repository, outcome.resulting_view, b).is_empty());
+    repository.validate().unwrap();
+}
+
+#[test]
+fn a_resolution_that_drops_all_of_a_changes_edits_leaves_it_empty_and_resolved() {
+    let io = Memory::default();
+    let ctx = ApplicationContext::new(&io);
+    let (mut repository, effective, b, conflicted) = half_applied(&io);
+    // Keep the revised ancestor's file: b no longer changes anything.
+    let target = lines("one", "zwölf");
+    let outcome = repository
+        .resolve_conflict(
+            repository.base_view().id,
+            effective,
+            ConflictResolution {
+                metadata: RevisionMetadata::default(),
+                conflict_revision: conflicted,
+                resolved: [("f".into(), Some(value(&io, &target)))].into(),
+            },
+            ctx,
+        )
+        .unwrap();
+    let view = repository.view(outcome.resulting_view).unwrap();
+    assert_eq!(view.tree.get("f"), Some(&value(&io, &target)));
+    assert_eq!(
+        repository
+            .conflicts(outcome.resulting_view)
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(view.unresolved_conflicts.is_empty());
+    assert!(current_edits(&repository, outcome.resulting_view, b).is_empty());
+    repository.validate().unwrap();
+}

@@ -423,11 +423,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         if application.revision_id != resolution.conflict_revision {
             return Err(RepositoryError::NotConflicted(resolution.conflict_revision).into());
         }
-        let ApplicationResultRecord::Conflicted {
-            partial_tree,
-            conflict,
-        } = application.result
-        else {
+        let ApplicationResultRecord::Conflicted { conflict, .. } = application.result else {
             return Err(RepositoryError::NotConflicted(resolution.conflict_revision).into());
         };
         let conflict = reader.conflict(conflict).await?;
@@ -438,8 +434,10 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .map(|edit| edit.path.as_str())
             .collect::<BTreeSet<_>>();
         wheat_core::check_resolved_paths(&conflict_paths, &resolution.resolved)?;
-        let removed = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
+        let conflicted = conflict.edits.keys().copied().collect::<BTreeSet<_>>();
 
+        // Each resolved path is captured from the target's file, replacing every edit the
+        // change made to it (`wheat_core::resolution_edits`).
         let trees = MerkleTreeStore::new(self.objects);
         let target = reader.view(application.target_view).await?;
         let mut replacements = BTreeMap::new();
@@ -449,19 +447,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let partial_values = trees.lookup_many(partial_tree, &resolved_paths).await?;
         let before_values = trees.lookup_many(target.tree, &resolved_paths).await?;
         let content_error =
             |error: crate::ContentStoreError| RepositoryError::ContentIo(error.to_string());
         let mut captured_content = crate::ContentWriteBatch::new(self.content);
         let capture_limits = wheat_core::guarded::Limits::default();
-        for (((path, after_value), partial_value), before_value) in resolution
-            .resolved
-            .iter()
-            .zip(partial_values)
-            .zip(before_values)
-        {
-            if partial_value == *after_value {
+        for ((path, after_value), before_value) in resolution.resolved.iter().zip(before_values) {
+            if before_value == *after_value {
                 continue;
             }
             // A file past the guarded bound on either side changes as a whole, as capture would
@@ -537,29 +529,13 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         }
         captured_content.commit().map_err(content_error)?;
 
-        let preserved = predecessor_edits
-            .keys()
-            .filter(|id| !removed.contains(id))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let replacement_edits = replacements.keys().copied().collect::<BTreeSet<_>>();
-        let mut edits = predecessor_edits.clone();
-        edits.retain(|id, _| preserved.contains(id));
-        edits.extend(replacements);
-        let revision_edits = RevisionEdits {
-            edits,
-            transition: EditTransition {
-                preserved,
-                added: replacement_edits.clone(),
-                removed: removed.clone(),
-                resolutions: vec![ConflictResolutionEvidence {
-                    application: resolution.application,
-                    conflicted_edits: removed,
-                    replacement_edits,
-                }],
-                ..EditTransition::default()
-            },
-        };
+        let revision_edits = wheat_core::resolution_edits(
+            &predecessor_edits,
+            conflicted,
+            resolution.application,
+            |path| resolution.resolved.contains_key(path),
+            replacements,
+        );
         self.revise(
             expected,
             basis_view,

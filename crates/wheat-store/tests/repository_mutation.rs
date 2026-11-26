@@ -501,7 +501,11 @@ async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference(
         Some((b"destination".as_slice(), FileKind::Symlink)),
     ] {
         resolve_conflict_like_the_reference(
-            [b"base", b"authored", b"upstream", b"destination"],
+            [b"base", b"upstream", b"destination"],
+            |content| {
+                content.put(b"authored").unwrap();
+                exact("file", Some(b"base"), b"authored")
+            },
             resolved,
         )
         .await;
@@ -522,25 +526,85 @@ async fn a_conflict_on_a_long_file_resolves_as_a_whole_file_like_the_reference()
         Some((b"short".as_slice(), FileKind::Regular)),
         Some((authored.as_slice(), FileKind::Regular)),
     ] {
-        resolve_conflict_like_the_reference([&base, &authored, &upstream, b"short"], resolved)
-            .await;
+        resolve_conflict_like_the_reference(
+            [&base, &upstream, b"short"],
+            |content| {
+                content.put(&authored).unwrap();
+                exact("file", Some(&base), &authored)
+            },
+            resolved,
+        )
+        .await;
     }
 }
 
-/// Change `parent` creates `file` as `original`, `child` replaces it with `authored`, then
-/// `parent` is revised to `upstream`, which leaves `child` conflicted. Resolving the
-/// conflict to `resolved` (deleting the file for `None`) must match the hydrated reference.
+/// Twelve numbered lines, with `first` and `last` in place of the first and last.
+fn lines(first: &str, last: &str) -> Vec<u8> {
+    let middle = [
+        "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+    ];
+    format!("{first}\n{}\n{last}\n", middle.join("\n")).into_bytes()
+}
+
+#[tokio::test]
+async fn resolving_a_file_the_change_also_applied_an_edit_to_matches_the_reference() {
+    // `child` edits the first and the last line; the revised parent rewrites the last, so
+    // the first line's edit applies and the last line's conflicts.
+    let (original, upstream) = (lines("one", "twelve"), lines("one", "zwölf"));
+    let (both, target) = (lines("ONE", "TWELVE and zwölf"), upstream.clone());
+    for resolved in [both.as_slice(), target.as_slice()] {
+        resolve_conflict_like_the_reference(
+            [&original, &upstream, resolved],
+            |content| {
+                let after = lines("ONE", "TWELVE");
+                let snapshot = |bytes| edit_capture::FileSnapshot {
+                    kind: FileKind::Regular,
+                    bytes,
+                };
+                let captured = edit_capture::capture_edit(
+                    "file",
+                    Some(snapshot(&original)),
+                    Some(snapshot(&after)),
+                    None,
+                    guarded::Limits::default(),
+                )
+                .unwrap();
+                assert_eq!(captured.edits.len(), 2);
+                for value in captured.content.into_values() {
+                    content.put(value.bytes()).unwrap();
+                }
+                content.put(&after).unwrap();
+                RevisionEdits {
+                    transition: EditTransition {
+                        added: captured.edits.keys().copied().collect(),
+                        ..EditTransition::default()
+                    },
+                    edits: captured.edits,
+                }
+            },
+            Some((resolved, FileKind::Regular)),
+        )
+        .await;
+    }
+}
+
+/// Change `parent` creates `file` as `original`, `child` edits it with `child_edits` (built
+/// with the content store, which holds every given file), then `parent` is revised to
+/// `upstream`, which leaves `child` conflicted. Resolving the conflict to `resolved`
+/// (deleting the file for `None`) must match the hydrated reference.
 async fn resolve_conflict_like_the_reference(
-    [original, authored, upstream, extra]: [&[u8]; 4],
+    [original, upstream, extra]: [&[u8]; 3],
+    child_edits: impl FnOnce(&ContentStore) -> RevisionEdits,
     resolved: Option<(&[u8], FileKind)>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let objects = LooseObjectStore::new(dir.path().join("objects"));
     let content = ContentStore::new(dir.path().join("content"));
     let heads = LocalPublicationStore::new(dir.path().join("head"));
-    for bytes in [original, authored, upstream, extra] {
+    for bytes in [original, upstream, extra] {
         content.put(bytes).unwrap();
     }
+    let child_edits = child_edits(&content);
 
     let mut reference = Repository::new(Tree::new());
     let base = reference.base_view().id;
@@ -566,7 +630,7 @@ async fn resolve_conflict_like_the_reference(
             effective,
             child,
             [parent],
-            exact("file", Some(original), authored),
+            child_edits,
             ApplicationContext::new(&content),
         )
         .unwrap();
