@@ -13,10 +13,10 @@ use wheat_core::{
 };
 
 use crate::{
-    Blame, BlameError, BlameLimits, ChangeMapStore, ContentStore, ContentStoreError,
-    HistoryMapError, HistoryMapStore, ImmutableObjectStore, MerkleTreeError, MerkleTreeStore,
-    PathHistoryIndex, PathHistoryIndexError, RepositoryHead, RepositoryPublicationError,
-    RepositoryReader, RetainedSetStore, TreeListing,
+    Blame, BlameError, BlameLimits, ChangeMapStore, ConflictIndexError, ContentStore,
+    ContentStoreError, HistoryMapError, HistoryMapStore, ImmutableObjectStore, MerkleTreeError,
+    MerkleTreeStore, PathHistoryIndex, PathHistoryIndexError, RepositoryHead,
+    RepositoryPublicationError, RepositoryReader, RetainedSetStore, TreeListing,
 };
 
 #[derive(Debug, Error)]
@@ -41,6 +41,8 @@ pub enum BrowseError {
     PathHistory(#[from] PathHistoryIndexError),
     #[error(transparent)]
     Blame(#[from] BlameError),
+    #[error(transparent)]
+    ConflictIndex(#[from] ConflictIndexError),
 }
 
 /// A file read by [`RepositoryBrowser::read_file`].

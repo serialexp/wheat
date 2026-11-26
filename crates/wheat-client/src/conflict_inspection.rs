@@ -1,44 +1,49 @@
 //! Bounded expansion and atomic rendering of durable conflicts.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     io::{self, Write},
+    num::NonZeroUsize,
+    path::Path,
 };
 
 use anyhow::Result;
 use serde::Serialize;
 use wheat_core::{
-    ApplicationId, ApplicationResultRecord, ChangeId, EditFailure, EditId, FileKind, FileValue,
-    ObjectId, RevisionId, ViewId,
+    ApplicationId, ChangeId, EditFailure, EditId, FileKind, FileValue, RevisionId, ViewId,
 };
 use wheat_store::{
-    ApplicationMapStore, ChangeMapStore, ConflictSetStore, ContentStore, ImmutableObjectStore,
-    PublicationStore, RepositoryReader, RetainedSetStore, RevisionMapStore,
+    BrowseError, ConflictIndex, ConflictIndexError, ConflictPageLimits, ContentStore,
+    ImmutableObjectStore, PublicationStore, RepositoryBrowser,
 };
 
-use crate::{local::LocalRepository, outcome::CliFailure};
+use crate::{
+    local::{CONFLICT_INDEX_FILE, LocalRepository},
+    outcome::CliFailure,
+};
 
 pub const MAX_CONFLICTS: usize = 100_000;
-const MAX_CURRENT_APPLICATIONS: usize = 250_000;
-pub const MAX_DISTINCT_EDITS: usize = 250_000;
 pub const MAX_EDIT_OCCURRENCES: usize = 250_000;
 pub const MAX_PATH_BYTES: usize = 4_096;
 const MAX_AGGREGATE_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-type CurrentApplication = (ChangeId, RevisionId, ApplicationId, ViewId);
+/// How many conflicts one index page reads.
+const PAGE_CONFLICTS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 #[derive(Debug, Serialize)]
 pub struct ConflictDocument {
     pub schema_version: u8,
     pub head_generation: u64,
+    /// The effective view's unresolved conflicts in canonical order, earliest first.
     pub conflicts: Vec<ConflictEntry>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ConflictEntry {
     pub id: wheat_core::ConflictId,
+    /// The conflicted change's index in the view's canonical order.
+    pub position: u64,
     pub base_view: ViewId,
     pub change_id: ChangeId,
     /// The conflicted change's title, so a person can tell which change it is.
@@ -56,14 +61,20 @@ pub struct ConflictEdit {
     pub reason: EditFailure,
 }
 
+/// The unresolved conflicts of `effective_view` in the store at `store_root`, read
+/// through the store's conflict index, which catches up first.
 pub async fn inspect(
     repository: &LocalRepository,
+    store_root: &Path,
     effective_view: ViewId,
 ) -> Result<ConflictDocument> {
+    let index =
+        ConflictIndex::open(&store_root.join(CONFLICT_INDEX_FILE)).map_err(index_failure)?;
     inspect_store(
         &repository.objects,
         &repository.content,
         &repository.heads,
+        &index,
         effective_view,
     )
     .await
@@ -73,224 +84,108 @@ async fn inspect_store<O: ImmutableObjectStore>(
     objects: &O,
     content: &ContentStore,
     heads: &impl PublicationStore,
+    index: &ConflictIndex,
     effective_view: ViewId,
 ) -> Result<ConflictDocument> {
     let head = heads.read()?;
-    let reader = RepositoryReader::new(objects, content);
-    // Every typed read authenticates the immutable object's bytes against the requested ID.
-    // Follow only the roots selected by this head: complete validation is deliberately reserved
-    // for `wheat validate`, since walking unrelated retained history makes inspection unbounded.
-    let envelope = reader.envelope(head.envelope).await?;
-    if envelope.id() != head.envelope {
-        return Err(CliFailure::corrupt("repository envelope identity mismatch"));
+    // Every typed read authenticates the immutable object's bytes against the requested ID,
+    // and the browser refuses a view the head doesn't retain. Only the roots this head
+    // selects are followed: complete validation is reserved for `wheat validate`.
+    let browser = RepositoryBrowser::open(objects, content, head)
+        .await
+        .map_err(browse_failure)?;
+    let total = browser
+        .conflict_count(index, effective_view)
+        .await
+        .map_err(browse_failure)?;
+    if total > MAX_CONFLICTS as u64 {
+        return Err(CliFailure::limit("conflict count exceeds inspection limit"));
     }
-    let state = reader.state(envelope.state).await?;
-    if state.id() != envelope.state {
-        return Err(CliFailure::corrupt("repository state identity mismatch"));
-    }
-    let retained = RetainedSetStore::new(objects);
-    if !retained
-        .contains(state.retained_views, ObjectId::from(effective_view))
-        .await?
-    {
-        return Err(CliFailure::corrupt(
-            "effective view is not retained by the current repository state",
-        ));
-    }
-    let working = reader.view(effective_view).await?;
-    if working.id() != effective_view {
-        return Err(CliFailure::corrupt("effective view identity mismatch"));
-    }
-    let applications = ApplicationMapStore::new(objects);
-    let mut application_cursor = applications.cursor(working.applications).await?;
-    let mut conflicted_applications = BTreeMap::<wheat_core::ConflictId, CurrentApplication>::new();
-    let mut application_count = 0usize;
-    while let Some((change_id, application_id)) = application_cursor.next().await? {
-        application_count = bounded_add(
-            application_count,
-            1,
-            MAX_CURRENT_APPLICATIONS,
-            "current application count",
-        )?;
-        let application = reader.application(application_id).await?;
-        let current_revision = RevisionMapStore::new(objects)
-            .get(working.revisions, change_id)
-            .await?;
-        if current_revision != Some(application.revision_id) {
-            return Err(CliFailure::corrupt(
-                "current application does not refer to the current revision",
-            ));
-        }
-        if let ApplicationResultRecord::Conflicted { conflict, .. } = application.result
-            && conflicted_applications
-                .insert(
-                    conflict,
-                    (
-                        change_id,
-                        application.revision_id,
-                        application_id,
-                        application.target_view,
-                    ),
-                )
-                .is_some()
-        {
-            return Err(CliFailure::corrupt(
-                "conflict is referenced by multiple current applications",
-            ));
-        }
-    }
-    let conflicts = ConflictSetStore::new(objects);
-    let mut cursor = conflicts.cursor(working.unresolved_conflicts).await?;
-    let mut entries = Vec::new();
-    let mut paths = BTreeMap::<EditId, String>::new();
-    let mut validated_edits = BTreeSet::<EditId>::new();
-    let mut retained_base_views = BTreeSet::<ViewId>::new();
+    let mut entries = Vec::with_capacity(total as usize);
     let mut edit_occurrences = 0usize;
     let mut aggregate_path_bytes = 0usize;
     let mut model_bytes = 0usize;
-    while let Some(id) = cursor.next().await? {
-        if entries.len() >= MAX_CONFLICTS {
-            return Err(CliFailure::limit("conflict count exceeds inspection limit"));
-        }
-        let conflict = reader.conflict(id).await?;
-        if conflict.id != id {
-            return Err(CliFailure::corrupt("conflict identity mismatch"));
-        }
-        if retained_base_views.insert(conflict.base_view) {
-            if !retained
-                .contains(state.retained_views, ObjectId::from(conflict.base_view))
-                .await?
-            {
-                return Err(CliFailure::corrupt(
-                    "conflict base view is not retained by the current repository state",
+    let mut after = None;
+    loop {
+        let Some(edits) = NonZeroUsize::new(MAX_EDIT_OCCURRENCES - edit_occurrences) else {
+            return Err(CliFailure::limit(
+                "conflict edit occurrence count exceeds inspection limit",
+            ));
+        };
+        let page = browser
+            .conflicts(
+                index,
+                effective_view,
+                after,
+                ConflictPageLimits {
+                    conflicts: PAGE_CONFLICTS,
+                    edits,
+                },
+            )
+            .await
+            .map_err(browse_failure)?;
+        for item in page.items {
+            if item.edits.len() < item.edit_count {
+                return Err(CliFailure::limit(
+                    "conflict edit occurrence count exceeds inspection limit",
                 ));
             }
-            let base_view = reader.view(conflict.base_view).await?;
-            if base_view.id() != conflict.base_view {
-                return Err(CliFailure::corrupt("conflict base view identity mismatch"));
-            }
-        }
-        model_bytes = bounded_add(model_bytes, 64, MAX_MODEL_BYTES, "conflict model")?;
-        let mut edits = Vec::new();
-        for (edit_id, evidence) in conflict.edits {
-            edit_occurrences = bounded_add(
-                edit_occurrences,
-                1,
-                MAX_EDIT_OCCURRENCES,
-                "conflict edit occurrence count",
+            edit_occurrences += item.edits.len();
+            model_bytes = bounded_add(
+                model_bytes,
+                64usize.saturating_add(item.title.len()),
+                MAX_MODEL_BYTES,
+                "conflict model",
             )?;
-            let path = if let Some(path) = paths.get(&edit_id) {
-                path.clone()
-            } else {
-                if paths.len() >= MAX_DISTINCT_EDITS {
-                    return Err(CliFailure::limit(
-                        "distinct conflict edit count exceeds inspection limit",
-                    ));
-                }
-                let path = reader.edit(edit_id).await?.path;
-                if path.len() > MAX_PATH_BYTES {
+            let mut edits = Vec::with_capacity(item.edits.len());
+            for edit in item.edits {
+                if edit.path.len() > MAX_PATH_BYTES {
                     return Err(CliFailure::limit(
                         "conflict edit path exceeds inspection limit",
                     ));
                 }
                 aggregate_path_bytes = bounded_add(
                     aggregate_path_bytes,
-                    path.len(),
+                    edit.path.len(),
                     MAX_AGGREGATE_PATH_BYTES,
                     "aggregate conflict path bytes",
                 )?;
-                paths.insert(edit_id, path.clone());
-                path
-            };
-            aggregate_path_bytes = bounded_add(
-                aggregate_path_bytes,
-                path.len(),
-                MAX_AGGREGATE_PATH_BYTES,
-                "aggregate conflict path bytes",
-            )?;
-            // IDs, target, enum tag and interference IDs are all retained in the output model.
-            let reason_bytes = match &evidence.reason {
-                EditFailure::Interference { with } => {
-                    if with.is_empty() {
-                        return Err(CliFailure::corrupt("empty edit interference evidence"));
-                    }
-                    for referenced in with {
-                        if validated_edits.insert(*referenced) {
-                            if validated_edits.len() > MAX_DISTINCT_EDITS {
-                                return Err(CliFailure::limit(
-                                    "distinct conflict edit count exceeds inspection limit",
-                                ));
-                            }
-                            reader.edit(*referenced).await?;
-                        }
-                    }
-                    with.len().checked_mul(32)
-                }
-                _ => Some(0),
+                // IDs, target, enum tag and interference IDs are all retained in the model.
+                let reason_bytes = match &edit.reason {
+                    EditFailure::Interference { with } => with.len().saturating_mul(32),
+                    _ => 0,
+                };
+                model_bytes = bounded_add(
+                    model_bytes,
+                    66usize
+                        .saturating_add(edit.path.len())
+                        .saturating_add(reason_bytes),
+                    MAX_MODEL_BYTES,
+                    "conflict model",
+                )?;
+                edits.push(ConflictEdit {
+                    id: edit.edit,
+                    path: edit.path,
+                    target: edit.found,
+                    reason: edit.reason,
+                });
             }
-            .ok_or_else(|| CliFailure::limit("conflict model size overflow"))?;
-            if validated_edits.insert(edit_id) && validated_edits.len() > MAX_DISTINCT_EDITS {
-                return Err(CliFailure::limit(
-                    "distinct conflict edit count exceeds inspection limit",
-                ));
-            }
-            model_bytes = bounded_add(
-                model_bytes,
-                32usize
-                    .checked_add(path.len())
-                    .and_then(|size| size.checked_add(34))
-                    .and_then(|size| size.checked_add(reason_bytes))
-                    .ok_or_else(|| CliFailure::limit("conflict model size overflow"))?,
-                MAX_MODEL_BYTES,
-                "conflict model",
-            )?;
-            edits.push(ConflictEdit {
-                id: edit_id,
-                path,
-                target: evidence.target,
-                reason: evidence.reason,
+            entries.push(ConflictEntry {
+                id: item.conflict,
+                position: item.position,
+                base_view: item.target_view,
+                change_id: item.change,
+                title: item.title,
+                revision_id: item.revision,
+                application_id: item.application,
+                edits,
             });
         }
-        edits.sort_by_key(|edit| edit.id);
-        let (change_id, revision_id, application_id) = correlate_conflict(
-            &mut conflicted_applications,
-            conflict.id,
-            conflict.base_view,
-        )?;
-        let change_object = ChangeMapStore::new(objects)
-            .get(state.changes, change_id)
-            .await?
-            .ok_or_else(|| {
-                CliFailure::corrupt("conflicted application refers to an unindexed logical change")
-            })?;
-        let change = reader.change(change_object).await?;
-        if change.id != change_id {
-            return Err(CliFailure::corrupt(
-                "change-map key does not match logical change identity",
-            ));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
         }
-        model_bytes = bounded_add(
-            model_bytes,
-            change.metadata.title.len(),
-            MAX_MODEL_BYTES,
-            "conflict model",
-        )?;
-        entries.push(ConflictEntry {
-            id: conflict.id,
-            base_view: conflict.base_view,
-            change_id,
-            title: change.metadata.title,
-            revision_id,
-            application_id,
-            edits,
-        });
     }
-    if !conflicted_applications.is_empty() {
-        return Err(CliFailure::corrupt(
-            "current conflicted application is absent from the unresolved conflict set",
-        ));
-    }
-    entries.sort_by_key(|conflict| conflict.id);
     Ok(ConflictDocument {
         schema_version: 1,
         head_generation: head.generation,
@@ -298,21 +193,29 @@ async fn inspect_store<O: ImmutableObjectStore>(
     })
 }
 
-fn correlate_conflict(
-    applications: &mut BTreeMap<wheat_core::ConflictId, CurrentApplication>,
-    conflict_id: wheat_core::ConflictId,
-    base_view: ViewId,
-) -> Result<(ChangeId, RevisionId, ApplicationId)> {
-    let (change_id, revision_id, application_id, target_view) =
-        applications.remove(&conflict_id).ok_or_else(|| {
-            CliFailure::corrupt("unresolved conflict has no current conflicted application")
-        })?;
-    if base_view != target_view {
-        return Err(CliFailure::corrupt(
-            "conflict base view does not match its current application's target view",
-        ));
+/// A browse read's failure as the store error behind it, so the command reports it by
+/// that error's kind.
+fn browse_failure(error: BrowseError) -> anyhow::Error {
+    match error {
+        BrowseError::Read(error) => error.into(),
+        BrowseError::Tree(error) => error.into(),
+        BrowseError::Content(error) => error.into(),
+        BrowseError::ConflictIndex(error) => index_failure(error),
+        BrowseError::IdentityMismatch(what) => CliFailure::corrupt(format!(
+            "repository record {what} does not match its identity"
+        )),
+        BrowseError::ViewNotRetained(_) => {
+            CliFailure::corrupt("effective view is not retained by the current repository state")
+        }
+        error => error.into(),
     }
-    Ok((change_id, revision_id, application_id))
+}
+
+fn index_failure(error: ConflictIndexError) -> anyhow::Error {
+    match error {
+        ConflictIndexError::Read(error) => error.into(),
+        error => error.into(),
+    }
 }
 
 fn bounded_add(current: usize, added: usize, limit: usize, name: &str) -> Result<usize> {
@@ -436,7 +339,8 @@ impl Write for BoundedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wheat_core::{ConflictId, ContentId, FileKind};
+    use wheat_core::{ConflictId, ContentId, FileKind, ObjectId};
+    use wheat_store::RepositoryReader;
 
     fn document(path: &str) -> ConflictDocument {
         ConflictDocument {
@@ -444,6 +348,7 @@ mod tests {
             head_generation: 42,
             conflicts: vec![ConflictEntry {
                 id: ConflictId::from_digest([1; 32]),
+                position: 0,
                 base_view: ViewId::from_digest([2; 32]),
                 change_id: ChangeId::from_bytes([5; 16]),
                 title: "Make it executable".to_owned(),
@@ -543,7 +448,8 @@ mod tests {
             inner: objects,
             refused: outcome.revision_id.into(),
         };
-        let document = inspect_store(&objects, &content, &heads, outcome.resulting_view)
+        let index = ConflictIndex::open(&root.path().join(CONFLICT_INDEX_FILE)).unwrap();
+        let document = inspect_store(&objects, &content, &heads, &index, outcome.resulting_view)
             .await
             .unwrap();
         assert!(document.conflicts.is_empty());
@@ -563,32 +469,6 @@ mod tests {
                 Some(CliFailure::LimitExceeded(_))
             ));
         }
-    }
-
-    #[test]
-    fn conflict_correlation_requires_an_application_and_matching_target_view() {
-        let conflict = ConflictId::from_digest([1; 32]);
-        let application = (
-            ChangeId::from_bytes([2; 16]),
-            RevisionId::from_digest([3; 32]),
-            ApplicationId::from_digest([4; 32]),
-            ViewId::from_digest([5; 32]),
-        );
-
-        let missing = correlate_conflict(&mut BTreeMap::new(), conflict, application.3)
-            .expect_err("missing application must be corrupt state");
-        assert!(matches!(
-            missing.downcast_ref::<CliFailure>(),
-            Some(CliFailure::CorruptState(_))
-        ));
-
-        let mut mismatched = BTreeMap::from([(conflict, application)]);
-        let mismatch = correlate_conflict(&mut mismatched, conflict, ViewId::from_digest([6; 32]))
-            .expect_err("base and target views must match");
-        assert!(matches!(
-            mismatch.downcast_ref::<CliFailure>(),
-            Some(CliFailure::CorruptState(_))
-        ));
     }
 
     #[test]
@@ -671,6 +551,7 @@ mod tests {
             conflicts: vec![
                 ConflictEntry {
                     id: ConflictId::from_digest([20; 32]),
+                    position: 1,
                     base_view: ViewId::from_digest([21; 32]),
                     change_id: ChangeId::from_bytes([24; 16]),
                     title: "first".to_owned(),
@@ -680,6 +561,7 @@ mod tests {
                 },
                 ConflictEntry {
                     id: ConflictId::from_digest([22; 32]),
+                    position: 2,
                     base_view: ViewId::from_digest([23; 32]),
                     change_id: ChangeId::from_bytes([27; 16]),
                     title: "second".to_owned(),

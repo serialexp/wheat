@@ -39,7 +39,9 @@ mod directory_chunks;
 mod durability;
 mod frontier_index;
 pub use frontier_index::{FrontierIndex, FrontierIndexError};
+mod conflict_index;
 mod path_history_index;
+pub use conflict_index::{ConflictIndex, ConflictIndexError, IndexedConflict, IndexedConflicts};
 pub use path_history_index::{PathHistoryIndex, PathHistoryIndexError, PathTouch, PathTouches};
 mod increment_validation;
 pub use increment_validation::{Arrival, IncrementBudget, IncrementReport};
@@ -81,6 +83,11 @@ mod repositories_directory;
 mod repository_directory;
 pub use browse::{
     BrowseError, BrowsedFile, HistoryItem, HistoryPage, RepositoryBrowser, TimeHistoryPage,
+};
+mod browse_conflicts;
+pub use browse_conflicts::{
+    ConflictDetail, ConflictEditItem, ConflictEditOutcome, ConflictItem, ConflictPage,
+    ConflictPageLimits, ConflictPath, ConflictPathEdit,
 };
 mod repository_envelope;
 mod repository_hydration;

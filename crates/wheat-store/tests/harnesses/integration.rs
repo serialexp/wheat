@@ -28,6 +28,8 @@ mod collection_failures;
 mod commit_content;
 #[path = "../commit_writer.rs"]
 mod commit_writer;
+#[path = "../conflict_index.rs"]
+mod conflict_index;
 #[path = "../content_batch.rs"]
 mod content_batch;
 #[path = "../content_blobs.rs"]

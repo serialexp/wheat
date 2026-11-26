@@ -28,6 +28,9 @@ const FRONTIER_INDEX_FILE: &str = "frontiers.sqlite";
 /// The path history index's file in a store; a cache the store can always rebuild.
 pub(crate) const PATH_HISTORY_INDEX_FILE: &str = "paths.sqlite";
 
+/// The conflict index's file in a store; a cache the store can always rebuild.
+pub(crate) const CONFLICT_INDEX_FILE: &str = "conflicts.sqlite";
+
 pub fn content_store(root: &Path) -> Result<ContentStore> {
     Ok(PackedObjectStore::open(storage_path(root)?)?.content_store())
 }

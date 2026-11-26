@@ -1373,6 +1373,7 @@ fn execute(cli: Cli) -> Result<Success> {
             let workspace = WorkspaceMetadata::read(&context.root)?;
             let document = runtime()?.block_on(conflict_inspection::inspect(
                 &local,
+                &context.store_root,
                 workspace.effective_view(),
             ))?;
             let mut human = Vec::new();
@@ -2691,6 +2692,7 @@ fn resolve(
     let runtime = runtime()?;
     let document = runtime.block_on(conflict_inspection::inspect(
         &local,
+        store_root,
         metadata.effective_view(),
     ))?;
     let conflict = choose_conflict(
