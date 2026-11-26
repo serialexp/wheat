@@ -17,6 +17,7 @@ mod bootstrap_validate;
 mod browse_history;
 mod checkpoint_stack;
 mod client_history;
+mod conflicts;
 mod content_gc;
 mod content_large_blob;
 mod content_repack_plan;
@@ -114,6 +115,7 @@ pub const CASES: &[&str] = &[
     browse_history::NAME,
     path_history::NAME,
     blame::NAME,
+    conflicts::NAME,
     content_gc::NAME,
     structure_gc::NAME,
     state_scan::NAME,
@@ -292,6 +294,7 @@ pub fn run_case(
         browse_history::NAME => browse_history::run(&context),
         path_history::NAME => path_history::run(&context),
         blame::NAME => blame::run(&context),
+        conflicts::NAME => conflicts::run(&context),
         content_gc::NAME => content_gc::run(&context),
         structure_gc::NAME => structure_gc::run(&context),
         state_scan::NAME => state_scan::run(&context),

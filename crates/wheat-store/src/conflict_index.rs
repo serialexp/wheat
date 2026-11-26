@@ -577,4 +577,78 @@ mod tests {
         assert!(first_from(tail, 3 * count + 1, read).unwrap().is_none());
         assert!(most <= bound, "a seek read {most} rows, over {bound}");
     }
+
+    /// The index at its stated ceiling: a view of a million changes, a tenth of them
+    /// conflicted. Writing it is a catch-up's write half; then the first page, a page
+    /// from the middle, the conflict at a position and the count read a bounded number
+    /// of rows. Wall times are printed, not asserted: run deliberately, in release, as
+    /// `cargo test --release -p wheat-store --lib -- --ignored --nocapture
+    /// conflict_index::tests::scale`.
+    #[test]
+    #[ignore = "a measurement at scale; run deliberately in release"]
+    fn scale_a_million_changes_with_a_hundred_thousand_conflicts() {
+        const CHANGES: u64 = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let index = ConflictIndex::open(&directory.path().join("conflicts.sqlite")).unwrap();
+        let digest = |position: u64, kind: u8| {
+            let mut bytes = [kind; 32];
+            bytes[..8].copy_from_slice(&position.to_be_bytes());
+            bytes
+        };
+        let started = std::time::Instant::now();
+        let mut tail = None;
+        let mut chunk = Vec::with_capacity(CHUNK_APPLICATIONS);
+        let mut last = None;
+        for position in 0..CHANGES {
+            let application = ApplicationId::from_digest(digest(position, 1));
+            let conflict = (position % 10 == 9).then(|| IndexedConflict {
+                position,
+                conflict: ConflictId::from_digest(digest(position, 2)),
+                application,
+                change: ChangeId::from_bytes([3; 16]),
+            });
+            chunk.push((application, conflict));
+            last = Some(application);
+            if chunk.len() == CHUNK_APPLICATIONS {
+                tail = index.write(tail, &chunk).unwrap();
+                chunk.clear();
+            }
+        }
+        tail = index.write(tail, &chunk).unwrap();
+        println!(
+            "wrote {CHANGES} applications in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
+        let tail = tail.unwrap();
+        assert_eq!(tail.ordinal + 1, CHANGES / 10);
+        assert_eq!(
+            index.application_tail(last.unwrap()).unwrap(),
+            Some(Some(tail.id))
+        );
+
+        let connection = index.connection();
+        let reads = Cell::new(0_u64);
+        let read = |id| {
+            reads.set(reads.get() + 1);
+            read_entry(&connection, ENTRY, id)
+        };
+        let bound = 3 * u64::from((CHANGES / 10).ilog2() + 1) + 4;
+        for (name, from) in [("first page", 0), ("middle page", CHANGES / 2)] {
+            reads.set(0);
+            let started = std::time::Instant::now();
+            let first = first_from(tail, from, read).unwrap().unwrap();
+            let end = (first.ordinal + 29).min(tail.ordinal);
+            let mut entry = ancestor(tail, end, read).unwrap();
+            while entry.ordinal > first.ordinal {
+                entry = read(entry.previous.unwrap()).unwrap();
+            }
+            let wall = started.elapsed().as_secs_f64();
+            println!("{name}: {} rows in {:.1}µs", reads.get(), wall * 1e6);
+            assert!(
+                reads.get() <= 2 * bound + 29,
+                "{name} read {} rows",
+                reads.get()
+            );
+        }
+    }
 }
