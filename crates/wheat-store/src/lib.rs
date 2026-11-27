@@ -185,8 +185,9 @@ pub use repository_directory::{
     PendingRepository, RepositoryDirectory, RepositoryDirectoryError, RepositoryFile,
 };
 pub use repository_mutation::{
-    AuthoringSession, PersistedConflictResolution, PersistedRepositoryMutator,
-    PreparedRepositoryMutation, RepositoryMutationError,
+    AuthoringSession, CompositionProgress, PROGRESS_EVERY_CHANGES, PROGRESS_INTERVAL,
+    PersistedConflictResolution, PersistedRepositoryMutator, PreparedRepositoryMutation,
+    RepositoryMutationError,
 };
 pub use repository_publication::{RepositoryPublicationError, RepositoryPublisher};
 pub use repository_rewrite::{

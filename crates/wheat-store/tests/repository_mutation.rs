@@ -493,9 +493,19 @@ async fn failed_content_resolution_never_prepares_or_advances_metadata() {
     assert_eq!(reader_state(&objects, &content, initial).await, before);
 }
 
-/// A revision recomposes every change above it, and each recomposed edit's values are
-/// fresh again. The ones the old state already requires were confirmed when they first
-/// became required, so a revision confirms, and counts, only the content it adds.
+#[derive(Default)]
+struct RecordedProgress(Mutex<Vec<(u64, u64)>>);
+
+impl CompositionProgress for RecordedProgress {
+    fn composed(&self, done: u64, total: u64) {
+        self.0.lock().unwrap().push((done, total));
+    }
+}
+
+/// A revision recomposes every change above it, reporting how far it has got, and each
+/// recomposed edit's values are fresh again. The ones the old state already requires
+/// were confirmed when they first became required, so a revision confirms, and counts,
+/// only the content it adds.
 #[tokio::test]
 async fn a_revision_confirms_only_the_content_it_adds() {
     let dir = tempfile::tempdir().unwrap();
@@ -535,6 +545,10 @@ async fn a_revision_confirms_only_the_content_it_adds() {
         effective = created.resulting_view;
     }
 
+    // Revising `a` composes it and the two changes above it again, and says so as
+    // it starts and as it ends.
+    let progress = RecordedProgress::default();
+    let mutator = mutator.with_progress(&progress);
     let (prepared, _) = mutator
         .revise(
             head,
@@ -547,8 +561,8 @@ async fn a_revision_confirms_only_the_content_it_adds() {
         )
         .await
         .unwrap();
-    // The changes above `a` are recomposed, so b1 and c1 are fresh again, but only a2
-    // is new.
+    assert_eq!(progress.0.lock().unwrap().clone(), vec![(0, 3), (3, 3)]);
+    // b1 and c1 are fresh again, but only a2 is new.
     assert_eq!(prepared.content_count(), 1);
     let head = mutator.publish(prepared).await.unwrap();
     let reader = RepositoryReader::new(&objects, &content);

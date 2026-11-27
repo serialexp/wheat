@@ -7,6 +7,7 @@
 //! copy-on-write.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wheat_core::*;
@@ -129,6 +130,74 @@ pub struct PersistedRepositoryMutator<'a, O, P> {
     pub(crate) content: &'a ContentStore,
     pub(crate) publications: &'a P,
     application_limits: wheat_core::edit_application::ApplicationLimits,
+    progress: Option<&'a dyn CompositionProgress>,
+}
+
+/// Told how far a mutation has got composing: of the changes it applies again,
+/// from the lowest canonical position it touches up, how many are applied. A
+/// revision under a long history recomposes every change above it, which is
+/// what takes the time, so this is what a caller shows while it waits.
+///
+/// Called once when composing starts (`done` 0), once when it ends (`done` =
+/// `total`), and between those at most every [`PROGRESS_EVERY_CHANGES`]
+/// changes or [`PROGRESS_INTERVAL`], whichever comes first, so reporting never
+/// costs a call per change. A mutation that composes more than once (none does
+/// today) starts again from 0.
+pub trait CompositionProgress: Send + Sync {
+    fn composed(&self, done: u64, total: u64);
+}
+
+/// Most changes composed between two progress reports.
+pub const PROGRESS_EVERY_CHANGES: u64 = 1024;
+/// Longest time between two progress reports while changes are being composed.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Counts composed changes and reports them to a [`CompositionProgress`] as
+/// that trait promises.
+pub(crate) struct ProgressTicker<'p> {
+    sink: Option<&'p dyn CompositionProgress>,
+    total: u64,
+    done: u64,
+    reported: u64,
+    reported_at: Instant,
+}
+
+impl<'p> ProgressTicker<'p> {
+    pub(crate) fn start(sink: Option<&'p dyn CompositionProgress>, total: usize) -> Self {
+        let total = total as u64;
+        if let Some(sink) = sink {
+            sink.composed(0, total);
+        }
+        Self {
+            sink,
+            total,
+            done: 0,
+            reported: 0,
+            reported_at: Instant::now(),
+        }
+    }
+
+    /// One more change composed.
+    pub(crate) fn step(&mut self) {
+        if self.sink.is_some() {
+            self.step_at(Instant::now());
+        }
+    }
+
+    fn step_at(&mut self, now: Instant) {
+        self.done += 1;
+        let Some(sink) = self.sink else {
+            return;
+        };
+        if self.done >= self.total
+            || self.done - self.reported >= PROGRESS_EVERY_CHANGES
+            || now.saturating_duration_since(self.reported_at) >= PROGRESS_INTERVAL
+        {
+            sink.composed(self.done, self.total);
+            self.reported = self.done;
+            self.reported_at = now;
+        }
+    }
 }
 
 /// A conflict-resolution intent over the paths whose edits failed in one exact application.
@@ -265,7 +334,19 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             content,
             publications,
             application_limits: Default::default(),
+            progress: None,
         }
+    }
+
+    /// Reports how far composing has got to `progress` (see [`CompositionProgress`]).
+    #[must_use]
+    pub fn with_progress(mut self, progress: &'a dyn CompositionProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub(crate) fn progress_ticker(&self, total: usize) -> ProgressTicker<'a> {
+        ProgressTicker::start(self.progress, total)
     }
 
     /// Replays edits under `limits` instead of the defaults, for history from elsewhere
@@ -924,6 +1005,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         let prefix = unchanged_prefix(active, &order, &pending);
         let mut view = self.prefix_view(active, prefix).await?;
         let mut authored = BTreeMap::new();
+        let mut progress = self.progress_ticker(order.len().saturating_sub(prefix));
         for change in order.into_iter().skip(prefix) {
             let (revision_id, generation, dependencies, committed_at, edits) =
                 if let Some(revision) = pending.remove(&change) {
@@ -1000,6 +1082,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
                     fresh,
                 )
                 .await?;
+            progress.step();
         }
         active.rebuild_graph();
         Ok((view, authored))
@@ -1658,4 +1741,74 @@ pub(crate) fn descendants(
         }
     }
     found
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<(u64, u64)>>);
+
+    impl CompositionProgress for Recorded {
+        fn composed(&self, done: u64, total: u64) {
+            self.0.lock().unwrap().push((done, total));
+        }
+    }
+
+    impl Recorded {
+        fn reports(&self) -> Vec<(u64, u64)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_fast_composition_reports_every_so_many_changes_and_its_end() {
+        let sink = Recorded::default();
+        let total = 3 * PROGRESS_EVERY_CHANGES as usize + 5;
+        let mut ticker = ProgressTicker::start(Some(&sink), total);
+        // The clock never moves, so only the count reports.
+        let now = ticker.reported_at;
+        for _ in 0..total {
+            ticker.step_at(now);
+        }
+        let total = total as u64;
+        assert_eq!(
+            sink.reports(),
+            vec![
+                (0, total),
+                (PROGRESS_EVERY_CHANGES, total),
+                (2 * PROGRESS_EVERY_CHANGES, total),
+                (3 * PROGRESS_EVERY_CHANGES, total),
+                (total, total),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slow_composition_reports_once_an_interval_has_passed() {
+        let sink = Recorded::default();
+        let mut ticker = ProgressTicker::start(Some(&sink), 10);
+        let start = ticker.reported_at;
+        let half = PROGRESS_INTERVAL / 2;
+        // Half an interval per change: a report every second change.
+        for step in 1..=10u32 {
+            ticker.step_at(start + half * step);
+        }
+        assert_eq!(
+            sink.reports(),
+            vec![(0, 10), (2, 10), (4, 10), (6, 10), (8, 10), (10, 10)]
+        );
+    }
+
+    #[test]
+    fn without_a_sink_nothing_is_reported_or_timed() {
+        let mut ticker = ProgressTicker::start(None, 5);
+        for _ in 0..5 {
+            ticker.step();
+        }
+        assert_eq!(ticker.done, 0, "the step without a sink doesn't count");
+    }
 }

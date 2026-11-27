@@ -207,6 +207,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
         let mut view = start;
         let mut conflicted = Vec::new();
         let mut combined = BTreeMap::new();
+        let mut progress = self.progress_ticker(order.len());
         for change in &order {
             let joining = joined.remove(change).expect("ordered change");
             let dependencies = joining.dependencies().clone();
@@ -245,6 +246,7 @@ impl<O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutator<'_
                 conflicted.push(*change);
             }
             view = next;
+            progress.step();
         }
         let resulting_view = view.id();
         for side in std::iter::once(&basis).chain(frontiers) {
