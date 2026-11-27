@@ -3,6 +3,16 @@
 Open work. When an item is done, move it to `TODO_DONE.md` under the same heading, in
 the same commit.
 
+## Found while profiling Gothab's branch resolution (2026-11-27)
+
+- [ ] **`stored_bytes_follow_writes_reopen_and_repack` fails under load.** In a loaded
+  `cargo nextest run -p wheat-store -p wheat-server` it failed once after a repack:
+  `StoredBytes::content_generation` read 6069 while listing the files found 6151
+  (`crates/wheat-store/tests/packed_stored_bytes.rs:106`). Alone it passes every time
+  and took 0.5 s against 15.7 s in the failed run. So the generation's accounting
+  and its files disagree for a moment while a repack writes them, or the
+  accounting misses a write. Find which.
+
 ## Found while naming published content (2026-11-07)
 
 - [ ] **A publish's delta bases come from the base view's tree, so there are

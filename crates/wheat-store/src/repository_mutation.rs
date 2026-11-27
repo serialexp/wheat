@@ -100,6 +100,8 @@ impl PreparedRepositoryMutation {
     pub fn object_count(&self) -> usize {
         self.objects
     }
+    /// The content the transition adds to what the state requires, each confirmed
+    /// stored and intact.
     #[must_use]
     pub fn content_count(&self) -> usize {
         self.content
@@ -1428,10 +1430,21 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
         resulting_view: ViewId,
         fresh: Fresh,
     ) -> Result<PreparedRepositoryMutation> {
-        tracing::debug_span!("resolve_fresh_content", count = fresh.content.len()).in_scope(
+        // A recomposed change's values are fresh again, but content the old state
+        // already requires was confirmed when it first became required and stays stored
+        // while it is. Only what this mutation adds is confirmed: a revision under a
+        // long history costs the content it writes, not a blob read per change above it.
+        let mut added = Vec::new();
+        let required = ContentSetStore::new(self.objects);
+        for id in &fresh.content {
+            if !required.contains(old.required_content, *id).await? {
+                added.push(*id);
+            }
+        }
+        tracing::debug_span!("resolve_fresh_content", count = added.len()).in_scope(
             || -> Result<()> {
                 // Confirmed rather than read, so a long blob is never held whole.
-                for id in &fresh.content {
+                for id in &added {
                     self.content
                         .confirm(*id)
                         .map_err(RepositoryPublicationError::Content)?;
@@ -1492,7 +1505,7 @@ impl<'a, O: ImmutableObjectStore, P: PublicationStore> PersistedRepositoryMutato
             state: state.id(),
             resulting_view,
             objects: fresh.objects + 1,
-            content: fresh.content.len(),
+            content: added.len(),
             _sealed: (),
         })
     }

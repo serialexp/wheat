@@ -493,6 +493,69 @@ async fn failed_content_resolution_never_prepares_or_advances_metadata() {
     assert_eq!(reader_state(&objects, &content, initial).await, before);
 }
 
+/// A revision recomposes every change above it, and each recomposed edit's values are
+/// fresh again. The ones the old state already requires were confirmed when they first
+/// became required, so a revision confirms, and counts, only the content it adds.
+#[tokio::test]
+async fn a_revision_confirms_only_the_content_it_adds() {
+    let dir = tempfile::tempdir().unwrap();
+    let objects = LooseObjectStore::new(dir.path().join("objects"));
+    let content = ContentStore::new(dir.path().join("content"));
+    let heads = LocalPublicationStore::new(dir.path().join("head"));
+    for bytes in [b"a1".as_slice(), b"a2", b"b1", b"c1"] {
+        content.put(bytes).unwrap();
+    }
+    let publisher = RepositoryPublisher::new(&objects, &content, &heads);
+    let repository = Repository::new(Tree::new());
+    let base = repository.base_view().id;
+    let mut head = publisher.initialize(&repository).await.unwrap();
+    let mutator = PersistedRepositoryMutator::new(&objects, &content, &heads);
+
+    let a = ChangeId::new();
+    let a1_edits = exact("a", None, b"a1");
+    let a1_edit = *a1_edits.edits.keys().next().unwrap();
+    let (prepared, a1) = mutator
+        .create(head, base, base, proposal(a, [], a1_edits))
+        .await
+        .unwrap();
+    assert_eq!(prepared.content_count(), 1);
+    head = mutator.publish(prepared).await.unwrap();
+    let mut effective = a1.resulting_view;
+    for (path, bytes) in [("b", b"b1"), ("c", b"c1")] {
+        let (prepared, created) = mutator
+            .create(
+                head,
+                base,
+                effective,
+                proposal(ChangeId::new(), [], exact(path, None, bytes)),
+            )
+            .await
+            .unwrap();
+        head = mutator.publish(prepared).await.unwrap();
+        effective = created.resulting_view;
+    }
+
+    let (prepared, _) = mutator
+        .revise(
+            head,
+            base,
+            effective,
+            a,
+            a1.revision_id,
+            RevisionMetadata::default(),
+            revision("a", None, b"a2", a1_edit),
+        )
+        .await
+        .unwrap();
+    // The changes above `a` are recomposed, so b1 and c1 are fresh again, but only a2
+    // is new.
+    assert_eq!(prepared.content_count(), 1);
+    let head = mutator.publish(prepared).await.unwrap();
+    let reader = RepositoryReader::new(&objects, &content);
+    let envelope = reader.envelope(head.envelope).await.unwrap();
+    reader.validate_complete(envelope.state).await.unwrap();
+}
+
 #[tokio::test]
 async fn conflict_resolution_deletion_mode_and_symlink_match_hydrated_reference() {
     for resolved in [
